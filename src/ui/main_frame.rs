@@ -158,9 +158,8 @@ impl MainFrame {
                 frame.close(true);
             }
             ID_ABOUT => message(&frame, "irctest: an accessible IRC client."),
-            ID_TOGGLE_SPEECH | ID_TOGGLE_ALL_SPEECH => {
-                message(&frame, "Not implemented yet.")
-            }
+            ID_TOGGLE_SPEECH => state.borrow_mut().toggle_tab_speech(),
+            ID_TOGGLE_ALL_SPEECH => state.borrow_mut().toggle_all_speech(),
             _ => event.skip(true),
         });
     }

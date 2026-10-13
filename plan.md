@@ -228,9 +228,21 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - `speech.rs` as described above; F5 / Shift+F5 menu accelerators.
 - Channel `PRIVMSG` → `"<nick> on <channel without leading #> says <text>"`. ACTION → `"<nick> on <channel> <action>"`. Query → `"<nick> says <text>"` (privately).
 - Messages mentioning our nick are spoken even when that tab's speech is off, but not when global speech is off.
-- Don't speak our own messages.
+- Our own messages are spoken too (user decision), using the same format and tab speech setting; saying our own nick doesn't count as a mention.
 - **Test:** with NVDA running, talk from a second client; toggle F5 on one channel and Shift+F5 globally.
 - **Test (mentions):** turn a channel's speech off with F5, mention your nick from a second client and check it's spoken; then Shift+F5 and check it's silent.
+
+**Done.**
+- `src/speech.rs`: `Speech` holds a leaked (program-lifetime) `Prism` and a `Backend<'static>` from `create_best()`; on this machine that's NVDA. prismer uses its `static` feature, so there's no prism DLL to ship.
+- Always the best backend: the `Prism` is built with an `on_availability` callback, which makes prism poll backend availability every second (2 agreeing samples to confirm a change) on its own thread. The callback only sets an `AtomicBool`; before the next speech, `create_best()` is called again. If a `speak` fails before the poll notices (NVDA just closed), it re-picks and retries once. So restarting NVDA goes NVDA → SAPI → NVDA without restarting the app. Startup with no backend at all also recovers once one appears.
+- `should_speak(global, tab, mentions_me)` and `mentions(text, nick)` (whole word, RFC 1459 case-insensitive, formatting stripped) are pure and unit-tested.
+- Spoken: PRIVMSGs and ACTIONs in channel and query tabs, including our own ("tyler on test says test"). Not spoken: notices, CTCP, joins/parts etc.
+- Errors from typed input (plain text in a server tab, usage messages, "Not connected.", "Couldn't send", "Not in a channel", etc.) are written to the tab and spoken (`State::complain`), interrupting and even with all speech off, like toggle feedback. Echoes of sent commands (`-> WHOIS bob`) aren't spoken.
+- Enter in an input box no longer beeps: wxDragon marks every event as skipped before calling a handler, so the Enter handler calls `event.skip(false)` to stop it reaching the edit control's default handling.
+- F5 toggles the selected tab and says "Speech off for test" (or "Server tabs aren't spoken."); Shift+F5 says "All speech off" / "All speech on". These interrupt queued speech and are spoken even with all speech off. Messages queue (no interrupt).
+- If prism can't start, "Speech isn't available: ..." is written once in the first server tab, and toggle feedback is written to the tab instead of spoken.
+- Debugging: with `IRCTEST_SPEECH_LOG` set, speech is printed to stdout (`SPEAK: ...`) instead of spoken.
+- **Tested against 10.0.0.2** with `IRCTEST_SPEECH_LOG` and a second client: channel message/action and private message spoken in the right format; notice not spoken; after F5, a plain message isn't spoken, "Tyler: are you there?" is, "tylers everywhere" isn't; after Shift+F5 neither mentions nor private messages are spoken; turning both back on restores speech.
 
 ### Step 8 — Polish
 - Reconnect on disconnect (with back-off) by building a new `Client` and replacing the stored `Sender`; menu item to reconnect now. Don't auto-reconnect after `/quit` or `NoUsableNick`.

@@ -9,9 +9,10 @@ use irc::client::Sender;
 use irc::proto::{ChannelExt, Command, Message, Prefix, Response};
 use irctest::commands::{Input, parse_input};
 use irctest::config::{Config, ServerConfig};
-use irctest::format::{format_message, message_time, timestamped};
+use irctest::format::{format_message, message_time, parse_ctcp, spoken_channel, strip_formatting, timestamped};
 use irctest::net::{self, EventSink, NetEvent, ServerId};
 use irctest::route::{Route, irc_eq, irc_lower, route};
+use irctest::speech::{Speech, mentions, should_speak};
 use tokio::runtime::Handle;
 use tokio::task::AbortHandle;
 use wxdragon::prelude::*;
@@ -33,7 +34,7 @@ pub struct ChatTab {
     /// Channel name, nick, or the server's name.
     name: String,
     tab: Tab,
-    #[allow(dead_code)] // read by speech in step 7
+    /// F5: speak new messages in this tab. On by default for channels and queries.
     speech: bool,
     /// Channels: whether we're currently in it.
     joined: bool,
@@ -65,6 +66,9 @@ pub struct State {
     next_tab_id: TabId,
     /// The "Not connected" page shown before any server tab exists.
     placeholder: Option<Panel>,
+    speech: Speech,
+    /// Whether the "speech isn't available" note has been shown (once, in the first server tab).
+    speech_error_shown: bool,
     /// For binding input boxes of new tabs back to this state.
     me: Weak<RefCell<State>>,
 }
@@ -81,6 +85,8 @@ impl State {
                 next_server_id: 1,
                 next_tab_id: 1,
                 placeholder: Some(placeholder),
+                speech: Speech::new(),
+                speech_error_shown: false,
                 me: me.clone(),
             })
         })
@@ -133,11 +139,7 @@ impl State {
     /// Disconnects the server of the selected tab: QUIT if connected, or cancels a connect
     /// still in progress. Errors are messages for the user.
     pub fn disconnect_current(&mut self) -> Result<(), String> {
-        let selected = self.notebook.selection();
-        let (s, _) = (selected >= 0)
-            .then(|| self.page_to_tab(selected as usize))
-            .flatten()
-            .ok_or("There's no server to disconnect.")?;
+        let (s, _) = self.current_tab().ok_or("There's no server to disconnect.")?;
         let server = &mut self.servers[s];
         if let Some(sender) = &server.sender {
             sender.send_quit("").map_err(|e| format!("Couldn't send QUIT: {e}"))?;
@@ -173,7 +175,63 @@ impl State {
         let s = self.servers.len() - 1;
         let t = self.insert_tab(s, TabKind::Server, &label, true);
         self.servers[s].tabs[t].tab.input.set_focus();
+        if let Some(error) = &self.speech.error {
+            if !self.speech_error_shown {
+                self.speech_error_shown = true;
+                self.line(s, t, &format!("Speech isn't available: {error}"));
+            }
+        }
         s
+    }
+
+    // ---- speech toggles ------------------------------------------------------------------
+
+    /// F5: speech on/off for the selected tab. Says the new state.
+    pub fn toggle_tab_speech(&mut self) {
+        let Some((s, t)) = self.current_tab() else { return };
+        let tab = &mut self.servers[s].tabs[t];
+        let feedback = match tab.kind {
+            TabKind::Server => "Server tabs aren't spoken.".to_string(),
+            TabKind::Channel | TabKind::Query => {
+                tab.speech = !tab.speech;
+                let name = if tab.kind == TabKind::Channel { spoken_channel(&tab.name) } else { &tab.name };
+                format!("Speech {} for {name}", if tab.speech { "on" } else { "off" })
+            }
+        };
+        self.feedback(s, t, &feedback);
+    }
+
+    /// Shift+F5: all speech on/off. Says the new state either way.
+    pub fn toggle_all_speech(&mut self) {
+        self.speech.enabled = !self.speech.enabled;
+        let feedback = if self.speech.enabled { "All speech on" } else { "All speech off" };
+        match self.current_tab() {
+            Some((s, t)) => self.feedback(s, t, feedback),
+            None => self.speech.say(feedback, true),
+        }
+    }
+
+    /// Speaks the result of a toggle, cutting off anything queued. Without speech, it's
+    /// written to the tab instead so there's still some feedback.
+    fn feedback(&mut self, s: usize, t: usize, text: &str) {
+        if self.speech.error.is_some() {
+            self.line(s, t, text);
+        } else {
+            self.speech.say(text, true);
+        }
+    }
+
+    /// A problem with something the user typed: written to the tab and spoken (interrupting,
+    /// and even with all speech off, since it answers the user's own action).
+    fn complain(&mut self, s: usize, t: usize, text: &str) {
+        self.line(s, t, text);
+        self.speech.say(text, true);
+    }
+
+    /// The selected tab, as (server, tab) indices.
+    fn current_tab(&self) -> Option<(usize, usize)> {
+        let selected = self.notebook.selection();
+        (selected >= 0).then(|| self.page_to_tab(selected as usize)).flatten()
     }
 
     // ---- tabs ----------------------------------------------------------------------------
@@ -318,12 +376,31 @@ impl State {
         let me = self.servers[s].nick.clone();
         if let Some(formatted) = format_message(msg) {
             let time = message_time(msg).unwrap_or_else(Local::now);
-            for t in self.route_to_tabs(s, msg, &me) {
+            let tabs = self.route_to_tabs(s, msg, &me);
+            for &t in &tabs {
                 self.line_at(s, t, time, &formatted.text);
+            }
+            if let (Some(speech), Some(&t)) = (&formatted.speech, tabs.first()) {
+                self.maybe_speak(s, t, msg, &me, speech);
             }
         }
         // After display: QUIT and NICK are routed by who was in each channel beforehand.
         self.update_membership(s, msg, &me);
+    }
+
+    /// Speaks a PRIVMSG shown in tab `t` if the speech settings allow it.
+    fn maybe_speak(&mut self, s: usize, t: usize, msg: &Message, me: &str, speech: &str) {
+        let Command::PRIVMSG(_, text) = &msg.command else { return };
+        let body = match parse_ctcp(text) {
+            Some(("ACTION", action)) => action,
+            _ => text.as_str(),
+        };
+        // Our own messages are spoken like anyone else's, but saying our own nick isn't a mention.
+        let from_me = msg.source_nickname().is_some_and(|n| irc_eq(n, me));
+        let mentions_me = !from_me && mentions(&strip_formatting(body), me);
+        if should_speak(self.speech.enabled, self.servers[s].tabs[t].speech, mentions_me) {
+            self.speech.message(speech);
+        }
     }
 
     /// The tabs a message should appear in, creating channel/query tabs as needed.
@@ -427,7 +504,7 @@ impl State {
         match input {
             Input::Say(text) | Input::Me(text) if kind == TabKind::Server => {
                 let _ = text;
-                self.line(s, t, "This is a server tab. Type /command to send a raw IRC command, e.g. /join #channel.");
+                self.complain(s, t, "This is a server tab. Type /command to send a raw IRC command, e.g. /join #channel.");
             }
             Input::Say(text) => self.privmsg(s, t, &target, &text, false),
             Input::Me(text) => self.privmsg(s, t, &target, &text, true),
@@ -445,7 +522,7 @@ impl State {
                 let channel = match channel {
                     Some(channel) => channel,
                     None if kind == TabKind::Channel => target,
-                    None => return self.line(s, t, "Not in a channel. Use /part #channel."),
+                    None => return self.complain(s, t, "Not in a channel. Use /part #channel."),
                 };
                 if let Some(sender) = self.sender_or_complain(s, t) {
                     let line = match reason {
@@ -457,7 +534,7 @@ impl State {
             }
             Input::Query { nick, text } => {
                 if nick.is_channel_name() {
-                    return self.line(s, t, "That's a channel. Use /join to join it.");
+                    return self.complain(s, t, "That's a channel. Use /join to join it.");
                 }
                 let q = self.open_tab(s, TabKind::Query, &nick, true);
                 if let Some(text) = text {
@@ -472,12 +549,12 @@ impl State {
             Input::Quit(reason) => {
                 if let Some(sender) = self.sender_or_complain(s, t) {
                     if let Err(e) = sender.send_quit(reason.unwrap_or_default()) {
-                        self.line(s, t, &format!("Couldn't send: {e}"));
+                        self.complain(s, t, &format!("Couldn't send: {e}"));
                     }
                 }
             }
             Input::Close => match kind {
-                TabKind::Server => self.line(s, t, "The server tab can't be closed. Use /quit to disconnect."),
+                TabKind::Server => self.complain(s, t, "The server tab can't be closed. Use /quit to disconnect."),
                 TabKind::Channel => {
                     if self.servers[s].tabs[t].joined {
                         if let Some(sender) = self.servers[s].sender.clone() {
@@ -493,7 +570,7 @@ impl State {
                     self.send_raw(s, t, &sender, &line);
                 }
             }
-            Input::Usage(text) => self.line(s, t, text),
+            Input::Usage(text) => self.complain(s, t, text),
         }
     }
 
@@ -503,7 +580,7 @@ impl State {
         let Some(sender) = self.sender_or_complain(s, t) else { return };
         let result = if action { sender.send_action(target, text) } else { sender.send_privmsg(target, text) };
         if let Err(e) = result {
-            return self.line(s, t, &format!("Couldn't send: {e}"));
+            return self.complain(s, t, &format!("Couldn't send: {e}"));
         }
 
         let me = self.servers[s].nick.clone();
@@ -514,13 +591,23 @@ impl State {
             command: Command::PRIVMSG(target.to_string(), body),
         };
         let Some(formatted) = format_message(&echo) else { return };
-        match self.find_tab(s, target) {
-            Some(dest) => self.line(s, dest, &formatted.text),
-            None => self.line(s, t, &format!("-> {target}: {text}")),
+        let dest = match self.find_tab(s, target) {
+            Some(dest) => {
+                self.line(s, dest, &formatted.text);
+                dest
+            }
+            None => {
+                self.line(s, t, &format!("-> {target}: {text}"));
+                t
+            }
+        };
+        if let Some(speech) = &formatted.speech {
+            let me = self.servers[s].nick.clone();
+            self.maybe_speak(s, dest, &echo, &me, speech);
         }
     }
 
-    fn send_raw(&self, s: usize, t: usize, sender: &Sender, line: &str) {
+    fn send_raw(&mut self, s: usize, t: usize, sender: &Sender, line: &str) {
         match net::send_raw(sender, line) {
             Ok(()) => {
                 // Commands with their own visible result (JOIN, PART, NICK) don't need an echo.
@@ -529,14 +616,14 @@ impl State {
                     self.line(s, t, &format!("-> {}", line.trim()));
                 }
             }
-            Err(e) => self.line(s, t, &format!("Couldn't send: {e}")),
+            Err(e) => self.complain(s, t, &format!("Couldn't send: {e}")),
         }
     }
 
-    fn sender_or_complain(&self, s: usize, t: usize) -> Option<Sender> {
+    fn sender_or_complain(&mut self, s: usize, t: usize) -> Option<Sender> {
         let sender = self.servers[s].sender.clone();
         if sender.is_none() {
-            self.line(s, t, "Not connected.");
+            self.complain(s, t, "Not connected.");
         }
         sender
     }
@@ -545,7 +632,10 @@ impl State {
 /// Wires Enter in a tab's input box to `State::handle_input`.
 fn bind_input(state: Weak<RefCell<State>>, id: TabId, tab: &Tab) {
     let input = tab.input;
-    tab.input.on_text_enter(move |_| {
+    tab.input.on_text_enter(move |event| {
+        // Mark Enter as handled; otherwise it reaches the edit control's default handling,
+        // which beeps.
+        event.skip(false);
         let line = input.get_value();
         input.clear();
         if let Some(state) = state.upgrade() {
