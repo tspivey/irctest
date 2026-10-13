@@ -10,8 +10,15 @@ fn main() {
     // The manifest is embedded by build.rs; this just silences wx's check for it.
     SystemOptions::set_option_by_int("msw.no-manifest-check", 1);
 
-    let _ = wxdragon::main(|_| match Config::load() {
-        Ok(config) => ui::main_frame::MainFrame::new(&config).show(),
+    // Network tasks run here; it lives until the GUI exits.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("couldn't start the tokio runtime");
+    let handle = runtime.handle().clone();
+
+    let _ = wxdragon::main(move |_| match Config::load() {
+        Ok(config) => ui::main_frame::MainFrame::new(config, handle).show(),
         Err(e) => {
             // Don't start with defaults: a later save would overwrite the user's file.
             let frame = Frame::builder().with_title("irctest").build();

@@ -182,6 +182,12 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - Typing in the server tab: `/command args` is sent raw (`/raw` or `/quote` also accepted).
 - **Test:** connect to 10.0.0.2, see MOTD; move the cursor up in the output while text arrives and check it stays put.
 
+**Done.** `main.rs` builds a multi-threaded tokio runtime and passes its `Handle` to `MainFrame`. GUI state is `Rc<RefCell<State>>` (config, notebook, servers with tab / `Sender` / `AbortHandle` / nick). The network sink pushes `(ServerId, NetEvent)` into an `mpsc` channel, then `call_after` + `wake_up_idle`; the posted closure calls a `thread_local!` drain handler set by `MainFrame::new` (skipped via `try_borrow_mut` if already draining).
+- `ui/tab.rs`: `Tab { panel, output, input }`, with "Output" / "Message" static labels before the controls for their accessible names. Tab order is tab control → Message → Output (Message is created first; the layout still puts Output on top). `append_line` saves the selection and insertion point, appends with a leading `\n` (so there's no empty last line), then restores them.
+- `Server → Connect` (temporary) connects to the first server in the config, reusing its tab on reconnect. The "Status" placeholder page is removed when the first server tab is added.
+- Server tab input: `/cmd args` is sent raw (`/raw` and `/quote` prefixes also accepted) and echoed as `-> cmd args`; plain text gets a hint.
+- **Tested with UI Automation against 10.0.0.2:** MOTD and channel lines appear in the server tab; a caret placed on an earlier line and a selected word both stayed where they were while more lines arrived. UIA reports wx controls as generic panes, but the user confirmed tabs read correctly with the screen reader.
+
 ### Step 5 — Channels, queries, routing
 - `JOIN` by us → create the channel tab (speech on) in the correct position. `PART`/`KICK` of us → note it in the tab (keep the tab so history stays). Rejoin reuses the existing tab.
 - `PRIVMSG`/`NOTICE` to a channel → channel tab; to us → query tab for the sender (created if missing, speech on by default as well). Server notices / numerics → server tab.
