@@ -1,6 +1,6 @@
 use wxdragon::prelude::*;
 
-use crate::config::Config;
+use irctest::config::Config;
 
 // Menu item ids. wx's stock ids are used where one exists.
 const ID_MANAGE_SERVERS: i32 = 1001;

@@ -86,7 +86,6 @@ impl Config {
         }
     }
 
-    #[allow(dead_code)] // used by the dialogs in step 6
     pub fn save(&self) -> Result<(), ConfigError> {
         self.save_to(Path::new(CONFIG_FILE))
     }
@@ -107,13 +106,11 @@ impl Config {
         if nick.is_empty() { self.nickname.trim() } else { nick }
     }
 
-    #[allow(dead_code)] // used when connecting in step 3
     pub fn effective_username<'a>(&'a self, server: &'a ServerConfig) -> &'a str {
         let user = self.username.trim();
         if user.is_empty() { self.effective_nick(server) } else { user }
     }
 
-    #[allow(dead_code)] // used when connecting in step 3
     pub fn effective_realname<'a>(&'a self, server: &'a ServerConfig) -> &'a str {
         let real = self.realname.trim();
         if real.is_empty() { self.effective_nick(server) } else { real }

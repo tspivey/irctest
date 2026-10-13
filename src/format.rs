@@ -23,7 +23,7 @@ impl Formatted {
     }
 }
 
-/// Formats an incoming message. `None` for messages not worth showing (PING, PONG, CAP).
+/// Formats an incoming message. `None` for messages not worth showing (PING, PONG, CAP, empty lines).
 pub fn format_message(msg: &Message) -> Option<Formatted> {
     let nick = msg.source_nickname().unwrap_or("");
     let source = source_name(msg);
@@ -79,6 +79,8 @@ pub fn format_message(msg: &Message) -> Option<Formatted> {
         Command::INVITE(_, channel) => Formatted::line(format!("{source} invites you to {channel}")),
         Command::ERROR(text) => Formatted::line(format!("Error: {text}")),
         Command::PING(..) | Command::PONG(..) | Command::CAP(..) => return None,
+        // Empty or prefix-only lines parse as an empty raw command.
+        Command::Raw(cmd, _) if cmd.is_empty() => return None,
         // Numerics: the first parameter is our own nick, so leave it out.
         Command::Response(_, args) => Formatted::line(args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ")),
         Command::Raw(cmd, args) if is_numeric(cmd) => {
@@ -298,6 +300,13 @@ mod tests {
     fn ping_pong_hidden() {
         assert_eq!(fmt("PING :irc.example.net\r\n"), None);
         assert_eq!(fmt(":irc.example.net PONG irc.example.net :x\r\n"), None);
+    }
+
+    #[test]
+    fn junk_lines_hidden() {
+        assert_eq!(fmt("\r\n"), None);
+        assert_eq!(fmt(":onlyprefix\r\n"), None);
+        assert_eq!(fmt("   \r\n"), None);
     }
 
     #[test]

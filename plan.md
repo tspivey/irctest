@@ -64,7 +64,7 @@ src/
 
 ### Things to check early (steps 0 and 3)
 
-- **Bad bytes:** confirm that a line which isn't valid UTF-8, or fails to parse, doesn't end the stream. Keep the `encoding` feature on and set `encoding = "UTF-8"`. If bad lines still kill the connection, that's a reason to reconsider the crate.
+- **Bad bytes:** confirm that a line which isn't valid UTF-8, or fails to parse, doesn't end the stream. Keep the `encoding` feature on and set `encoding = "UTF-8"`. If bad lines still kill the connection, that's a reason to reconsider the crate. **Checked in step 3: invalid UTF-8 and junk lines both leave the connection up.**
 - **Maintenance:** 1.1.0 was released in March 2025, 1.0.0 in March 2024. It's widely used and stable, but fixes may be slow.
 
 ### Config file shape
@@ -140,7 +140,7 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - Menus: `Menu::builder().append_item(id, "Label\tAccel", help)`, `frame.on_menu_selected(|e: MenuEventData| e.get_id())`. F5 / Shift+F5 accelerators go in the label.
 - `Timer::new(&owner)`, `on_tick`, `start(ms, one_shot)` exist if we need the fallback.
 - `irc::proto::FormattedStringExt::strip_formatting` exists, but turned out to be incomplete (see step 2).
-- **Bad bytes:** with the `encoding` feature, undecodable bytes are replaced, not an error. But a line that fails to *parse* (empty line, invalid command) returns an error from the codec, and tokio-util's framed stream ends after an error. So one malformed line could drop the connection; test it in step 3.
+- **Bad bytes:** with the `encoding` feature, undecodable bytes are replaced, not an error. But a line that fails to *parse* (empty line, invalid command) returns an error from the codec, and tokio-util's framed stream ends after an error. So one malformed line could drop the connection; test it in step 3. (Step 3: the junk lines tried all parse as an empty raw command, so this didn't happen.)
 - `build.rs` embeds a Windows manifest (common controls v6, UTF-8, per-monitor DPI) via `embed-manifest`, as the wxDragon examples do. Release builds use the Windows subsystem (no console).
 
 ### Step 1 — Config
@@ -157,7 +157,7 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 
 **Done.** `format_message(&Message) -> Option<Formatted { text, speech }>`; `None` for PING/PONG/CAP. Speech is only set for PRIVMSG and ACTION (`"bob on test says hi"`, `"bob on test waves"`, privately `"bob says hi"` / `"bob waves"`); notices and other CTCPs are shown but not spoken. Also formats JOIN/PART/QUIT/NICK/TOPIC/KICK/MODE/INVITE/ERROR, numerics (dropping our nick from the first parameter) and falls back to the raw line. Channel names are spoken without their leading `#`s.
 - Our own `strip_formatting` replaces the crate's: `FormattedStringExt` misses italics (`\x1D`), strikethrough (`\x1E`), monospace (`\x11`) and hex colours (`\x04`), and leaves digits behind for codes like `\x0304,05`.
-- `mod format` has `#[allow(dead_code)]` in `main.rs` until step 3 uses it; remove it then.
+- `mod format` had `#[allow(dead_code)]` in `main.rs`; removed in step 3 when it moved into the library.
 
 ### Step 3 — Connection task (no GUI yet)
 - `net.rs`: `connect(handle, server_id, &ServerConfig, nick, event_sink)`; once the client is created, its `Sender` is handed to the GUI with the `Connected` event.
@@ -165,6 +165,14 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - On `001`: send each `connect_commands` line as `Command::Raw`.
 - Report `NickChanged` when `current_nickname()` changes; report `Disconnected` with the error text when the stream ends.
 - **Test:** temporary `examples/headless.rs` that connects to 10.0.0.2, prints messages and joins a channel. Also try a nick that's already taken and a non-UTF-8 line from a second client. TLS gets tested against ZNC later (the LAN server is plain only).
+
+**Done.** `config`, `format` and `net` moved into a library target (`src/lib.rs`) so the example can use them; the binary uses `irctest::...`.
+- `net::connect(&Handle, ServerId, &Config, &ServerConfig, EventSink) -> AbortHandle`. `EventSink` is `Arc<dyn Fn(ServerId, NetEvent) + Send + Sync>`. Events: `Connected(Sender)`, `Message`, `NickChanged`, `Error` (non-fatal), `Disconnected(reason)` (always last; also sent for config problems like a missing nick).
+- `net::send_raw(&Sender, line)` parses the typed line into a `Message` before sending, so `PRIVMSG #chan :hi there` is re-serialised correctly. Connect commands use it too.
+- Unparseable lines (`InvalidMessage`) are reported as `Error` and the loop carries on; `NoUsableNick` and any other error end the connection.
+- `examples/headless.rs` connects to a server from `irctest.toml` (first, or by name), prints lines and speech text, and sends stdin lines raw; EOF sends QUIT.
+- **Tested against 10.0.0.2 (miniircd 2.3)** with a second raw client holding `tyler`: alt nick `tyler_` used, `JOIN #test` sent after 001, channel/action/colour/private messages formatted and given speech, a Latin-1 line arrived as `caf\u{FFFD}` and the connection carried on, a raw `PRIVMSG` from stdin reached the other client, QUIT closed cleanly.
+- **Tested against a fake localhost server** sending an empty line, a prefix-only line and a whitespace-only line: these don't fail to parse; they become `Command::Raw("", [])`. The connection survives, and `format_message` now hides them.
 
 ### Step 4 — Server tab in the GUI
 - `ui/tab.rs`: page panel with output (top, expands) and input (bottom). Enter in input → handler.
