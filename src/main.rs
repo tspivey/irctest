@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+#[allow(dead_code)] // not called until step 3; remove then
+mod format;
 mod ui;
 
 use config::{CONFIG_FILE, Config};

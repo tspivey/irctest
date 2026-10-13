@@ -54,7 +54,6 @@ src/
 - CTCP replies (`VERSION`, `PING`, `TIME`, `SOURCE`, `USERINFO`, `FINGER`) with the `ctcp` feature.
 - TLS: `use_tls`, with Windows' native TLS (`tls-native`, the default) or rustls (`tls-rust`).
 - Outgoing flood throttling (`burst_window_length`, `max_messages_in_burst`).
-- Formatting code stripping (`irc::proto::colors::FormattedStringExt::strip_formatting`; confirm the path in step 0).
 
 ### What we still do ourselves
 
@@ -140,7 +139,7 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - `TextCtrl`: styles `MultiLine | ReadOnly | Rich2`, `ProcessEnter` + `on_text_enter`; `get_insertion_point` / `set_insertion_point`, `get_selection` / `set_selection`, `append_text`, `get_last_position` all exist.
 - Menus: `Menu::builder().append_item(id, "Label\tAccel", help)`, `frame.on_menu_selected(|e: MenuEventData| e.get_id())`. F5 / Shift+F5 accelerators go in the label.
 - `Timer::new(&owner)`, `on_tick`, `start(ms, one_shot)` exist if we need the fallback.
-- `irc::proto::FormattedStringExt::strip_formatting` exists (re-exported as `irc::proto::colors::FormattedStringExt` too).
+- `irc::proto::FormattedStringExt::strip_formatting` exists, but turned out to be incomplete (see step 2).
 - **Bad bytes:** with the `encoding` feature, undecodable bytes are replaced, not an error. But a line that fails to *parse* (empty line, invalid command) returns an error from the codec, and tokio-util's framed stream ends after an error. So one malformed line could drop the connection; test it in step 3.
 - `build.rs` embeds a Windows manifest (common controls v6, UTF-8, per-monitor DPI) via `embed-manifest`, as the wxDragon examples do. Release builds use the Windows subsystem (no console).
 
@@ -155,6 +154,10 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - `format.rs`: turn an `irc::proto::Message` into a display line and (for PRIVMSG/ACTION) speech text, with formatting codes stripped.
 - Recognise `\x01ACTION ...\x01` in PRIVMSG text (the crate parses the line but leaves CTCP payloads in the text).
 - **Test:** unit tests built from `"...".parse::<Message>()`: channel message, query, ACTION, NOTICE, colour codes.
+
+**Done.** `format_message(&Message) -> Option<Formatted { text, speech }>`; `None` for PING/PONG/CAP. Speech is only set for PRIVMSG and ACTION (`"bob on test says hi"`, `"bob on test waves"`, privately `"bob says hi"` / `"bob waves"`); notices and other CTCPs are shown but not spoken. Also formats JOIN/PART/QUIT/NICK/TOPIC/KICK/MODE/INVITE/ERROR, numerics (dropping our nick from the first parameter) and falls back to the raw line. Channel names are spoken without their leading `#`s.
+- Our own `strip_formatting` replaces the crate's: `FormattedStringExt` misses italics (`\x1D`), strikethrough (`\x1E`), monospace (`\x11`) and hex colours (`\x04`), and leaves digits behind for codes like `\x0304,05`.
+- `mod format` has `#[allow(dead_code)]` in `main.rs` until step 3 uses it; remove it then.
 
 ### Step 3 — Connection task (no GUI yet)
 - `net.rs`: `connect(handle, server_id, &ServerConfig, nick, event_sink)`; once the client is created, its `Sender` is handed to the GUI with the `Connected` event.
