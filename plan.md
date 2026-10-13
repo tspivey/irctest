@@ -135,7 +135,8 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 
 **Done. Findings (wxDragon at git `e32baf6`, irc 1.1.0, prismer 0.1.4):**
 - `wxdragon::call_after(Box<dyn FnOnce() + Send>)` only queues the closure; the queue is drained in the app's idle handler. Call `wxdragon::wake_up_idle()` after it so a quiet GUI processes it straight away. Widgets aren't `Send`, so the closure can't capture them: the network side pushes events into a channel and the posted closure drains it into GUI-thread state (e.g. a `thread_local!`).
-- `Notebook` has `add_page`, `insert_page`, `remove_page`, `selection`, `set_selection`, `get_page`, but no `set_page_text` or `delete_page`. Renaming a tab = remove and re-insert; after `remove_page` the panel must be destroyed ourselves. (`AuiNotebook` has both, but it's custom-drawn and likely worse for screen readers; stick with `Notebook`.)
+- `Notebook` has `add_page`, `insert_page`, `remove_page`, `selection`, `set_selection`, `get_page`, but no `set_page_text` or `delete_page`; after `remove_page` the panel must be destroyed ourselves. wxWidgets' `wxNotebook::SetPageText` exists, but wxdragon-sys (upstream HEAD `e32baf6`) has no `wxd_Notebook_SetPageText` binding. **Decision:** rename tabs by calling `wxd_Treebook_SetPageText` (through a `wxdragon-sys` dependency) with the notebook's pointer. It does `((wxTreebook*)self)->SetPageText(..)`, a virtual call on `wxBookCtrlBase`, so it dispatches to `wxNotebook::SetPageText`. It works in practice but is technically undefined behaviour, so it lives in one small `unsafe` helper (`set_page_text` in `ui/`). If wxDragon later gains `wxd_Notebook_SetPageText`, switch the helper to it.
+  (`AuiNotebook` has a proper binding, but it's custom-drawn and likely worse for screen readers; stick with `Notebook`.)
 - `TextCtrl`: styles `MultiLine | ReadOnly | Rich2`, `ProcessEnter` + `on_text_enter`; `get_insertion_point` / `set_insertion_point`, `get_selection` / `set_selection`, `append_text`, `get_last_position` all exist.
 - Menus: `Menu::builder().append_item(id, "Label\tAccel", help)`, `frame.on_menu_selected(|e: MenuEventData| e.get_id())`. F5 / Shift+F5 accelerators go in the label.
 - `Timer::new(&owner)`, `on_tick`, `start(ms, one_shot)` exist if we need the fallback.
@@ -147,6 +148,8 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - `config.rs` with `Config` and `ServerConfig`, `load()` / `save()` for `./irctest.toml`.
 - `effective_nick(&ServerConfig)` returns the server nick or the global one.
 - **Test:** unit tests for round-trip and missing-file default; hand-write an `irctest.toml` for the LAN server.
+
+**Done.** All fields use `#[serde(default)]` (port defaults to 6667). `username` / `realname` are blank = use the nick (`effective_username` / `effective_realname`). A file that exists but can't be read or parsed shows an error and exits instead of starting with defaults, so a later save can't overwrite it. `save()` writes `irctest.toml.tmp` and renames it over the original. `irctest.toml` is in `.gitignore` since it can hold passwords. The Status page shows the server count and global nickname as a visible check.
 
 ### Step 2 — Message formatting
 - `format.rs`: turn an `irc::proto::Message` into a display line and (for PRIVMSG/ACTION) speech text, with formatting codes stripped.
@@ -196,7 +199,7 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 
 ### Step 8 — Polish
 - Reconnect on disconnect (with back-off) by building a new `Client` and replacing the stored `Sender`; menu item to reconnect now. Don't auto-reconnect after `/quit` or `NoUsableNick`.
-- Update tab labels on nick change for queries; show topic on join (`332`).
+- Update tab labels on nick change for queries (via the `set_page_text` helper); show topic on join (`332`).
 - Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+W to close a tab; Page Up/Down in input scrolls output.
 - Input history (Up/Down in input box).
 - Limit output buffer size (trim oldest lines past N).

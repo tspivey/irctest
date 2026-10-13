@@ -1,5 +1,7 @@
 use wxdragon::prelude::*;
 
+use crate::config::Config;
+
 // Menu item ids. wx's stock ids are used where one exists.
 const ID_MANAGE_SERVERS: i32 = 1001;
 const ID_SETTINGS: i32 = 1002;
@@ -12,7 +14,7 @@ pub struct MainFrame {
 }
 
 impl MainFrame {
-    pub fn new() -> Self {
+    pub fn new(config: &Config) -> Self {
         let frame = Frame::builder()
             .with_title("irctest")
             .with_size(Size::new(900, 650))
@@ -22,7 +24,7 @@ impl MainFrame {
 
         let main = Self { frame, notebook };
         main.build_menus();
-        main.add_placeholder_page();
+        main.add_placeholder_page(config);
         main.bind_menu_events();
         main
     }
@@ -59,12 +61,17 @@ impl MainFrame {
     }
 
     /// Until connections exist (step 4) the notebook gets one page so there's something to focus.
-    fn add_placeholder_page(&self) {
+    fn add_placeholder_page(&self, config: &Config) {
         let panel = Panel::builder(&self.notebook).build();
         let output = TextCtrl::builder(&panel)
             .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
             .build();
-        output.set_value("Not connected.");
+        let servers = match config.servers.len() {
+            1 => "1 server".to_string(),
+            n => format!("{n} servers"),
+        };
+        let nick = if config.nickname.is_empty() { "not set" } else { &config.nickname };
+        output.set_value(&format!("Not connected. {servers} configured. Global nickname: {nick}."));
 
         let sizer = BoxSizer::builder(Orientation::Vertical).build();
         sizer.add(&output, 1, SizerFlag::Expand | SizerFlag::All, 4);
