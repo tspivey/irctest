@@ -749,6 +749,7 @@ dependencies = [
 name = "irctest"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "embed-manifest",
  "futures",
  "irc",

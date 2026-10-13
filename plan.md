@@ -195,8 +195,17 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - Output line format: `[HH:MM] <nick> text`, `* nick action`, `-nick- notice`. Use the `server-time` tag for the timestamp when present.
 - `commands.rs`: plain text → `PRIVMSG <tab target>`; `/me`, `/join`, `/part [reason]`, `/msg nick text`, `/query nick`, `/nick`, `/quit [reason]`, `/close` (part and remove the tab); anything else sent raw.
 - Our own messages are echoed into the tab (unless the server supports `echo-message` — skip for now).
-- When a tab is selected, focus its input box.
+- Selecting a tab does **not** move focus to its input box (that would break arrowing across the tab control). Focus only moves when the user opens a tab (`/join`, `/query`) or closes the focused one.
 - **Test:** two clients on the LAN server talking in a channel and in private.
+
+**Done.**
+- `src/commands.rs`: `parse_input(line) -> Option<Input>` (`Say`, `Me`, `Msg`, `Join`, `Part`, `Query`, `Nick`, `Quit`, `Close`, `Raw`, `Usage`). `//text` sends `/text`; unknown `/cmd args` is sent raw.
+- `src/route.rs`: `route(&Message, me) -> Route` (`Server`, `Channel`, `Query`, `TabIfOpen`, `UserTabs`) plus RFC 1459 `irc_eq` / `irc_lower`. Notices go to the sender's query tab if open, else the server tab; non-ACTION CTCP goes to the server tab; numerics whose second parameter names an open tab (topic, names, "no such nick") go there.
+- `src/ui/state.rs`: per server, `tabs: Vec<ChatTab>` in notebook order (server, channels, queries); page index = earlier servers' tab counts + local index. Channel tabs track `joined` and an `irc_lower` nick set (from JOIN/PART/KICK/QUIT/NICK and 353) to route QUIT and NICK. Tabs created by incoming traffic aren't selected; a JOIN is selected only if we asked for it with `/join`. Disconnect marks all channels parted and is shown in every tab of that server.
+- Lines are `[HH:MM] text`, using the `server-time` tag when present (`format::message_time`, `chrono`). Topic/names numerics are formatted ("Topic for #x: ...", "Users on #x: ..."); 366 is hidden.
+- Our own messages are echoed by formatting a PRIVMSG with our nick as the source (so they look like everyone else's); `/msg` to a target without a tab is echoed as `-> target: text` in the current tab. JOIN/PART/NICK aren't echoed (the server's reply shows them).
+- Query tabs aren't renamed on nick change yet (step 8), so messages from the new nick open a new query tab.
+- **Tested against 10.0.0.2** with two raw clients (tab labels read via `TCM_GETITEM`): tab order `lan, #test, #second, bob, carol`; `/join` and `/query` select their tab, incoming traffic doesn't; channel text, `/me` and `/query` text arrive; QUIT and NICK show in the right query tabs; `/close` removes the tab and focus moves to the newly shown page.
 
 ### Step 6 — Server manager and settings dialogs
 - `Server → Manage servers…` (Ctrl+S or similar): list box of servers + buttons **Connect, Add, Edit, Delete, Close**. Connect is the default button when a server is selected; Enter on the list connects.

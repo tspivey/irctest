@@ -3,7 +3,8 @@
 //! Which tab a line goes to, timestamps, and whether to actually speak are decided by the
 //! caller; this module only produces the text.
 
-use irc::proto::{ChannelExt, Command, Message, Prefix};
+use chrono::{DateTime, Local, TimeZone};
+use irc::proto::{ChannelExt, Command, Message, Prefix, Response};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Formatted {
@@ -82,6 +83,26 @@ pub fn format_message(msg: &Message) -> Option<Formatted> {
         // Empty or prefix-only lines parse as an empty raw command.
         Command::Raw(cmd, _) if cmd.is_empty() => return None,
         // Numerics: the first parameter is our own nick, so leave it out.
+        Command::Response(Response::RPL_NAMREPLY, args) if args.len() >= 4 => {
+            Formatted::line(format!("Users on {}: {}", args[2], args[3]))
+        }
+        Command::Response(Response::RPL_ENDOFNAMES, _) => return None,
+        Command::Response(Response::RPL_NOTOPIC, args) if args.len() >= 2 => {
+            Formatted::line(format!("No topic is set for {}", args[1]))
+        }
+        Command::Response(Response::RPL_TOPIC, args) if args.len() >= 3 => {
+            Formatted::line(format!("Topic for {}: {}", args[1], args[2]))
+        }
+        Command::Response(Response::RPL_TOPICWHOTIME, args) if args.len() >= 3 => {
+            let setter = args[2].split('!').next().unwrap_or(&args[2]);
+            let when = args
+                .get(3)
+                .and_then(|t| t.parse::<i64>().ok())
+                .and_then(|t| Local.timestamp_opt(t, 0).single())
+                .map(|t| format!(" on {}", t.format("%Y-%m-%d %H:%M")))
+                .unwrap_or_default();
+            Formatted::line(format!("Topic for {} set by {setter}{when}", args[1]))
+        }
         Command::Response(_, args) => Formatted::line(args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ")),
         Command::Raw(cmd, args) if is_numeric(cmd) => {
             Formatted::line(args.iter().skip(1).cloned().collect::<Vec<_>>().join(" "))
@@ -102,6 +123,22 @@ fn source_name(msg: &Message) -> &str {
         Some(Prefix::ServerName(name)) => name,
         None => "*",
     }
+}
+
+/// When the message was sent, from its IRCv3 `time` tag (`server-time`), if it has one.
+pub fn message_time(msg: &Message) -> Option<DateTime<Local>> {
+    msg.tags
+        .as_ref()?
+        .iter()
+        .find(|tag| tag.0 == "time")
+        .and_then(|tag| tag.1.as_deref())
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&Local))
+}
+
+/// `"[HH:MM] text"`, in local time.
+pub fn timestamped(time: DateTime<Local>, text: &str) -> String {
+    format!("[{}] {text}", time.format("%H:%M"))
 }
 
 /// A channel name as it should be spoken: without its leading `#`s.
@@ -300,6 +337,25 @@ mod tests {
     fn ping_pong_hidden() {
         assert_eq!(fmt("PING :irc.example.net\r\n"), None);
         assert_eq!(fmt(":irc.example.net PONG irc.example.net :x\r\n"), None);
+    }
+
+    #[test]
+    fn topic_and_names_numerics() {
+        assert_eq!(text(":srv 332 tyler #test :the topic\r\n"), "Topic for #test: the topic");
+        assert_eq!(text(":srv 331 tyler #test :No topic is set\r\n"), "No topic is set for #test");
+        assert_eq!(text(":srv 333 tyler #test bob!b@h\r\n"), "Topic for #test set by bob");
+        assert!(text(":srv 333 tyler #test bob 1760356800\r\n").starts_with("Topic for #test set by bob on 20"));
+        assert_eq!(text(":srv 353 tyler = #test :tyler @bob\r\n"), "Users on #test: tyler @bob");
+        assert_eq!(fmt(":srv 366 tyler #test :End of NAMES list\r\n"), None);
+    }
+
+    #[test]
+    fn server_time_tag() {
+        let msg: Message = "@time=2026-10-13T12:34:56.000Z :bob!b@h PRIVMSG #test :hi\r\n".parse().unwrap();
+        let expected = DateTime::parse_from_rfc3339("2026-10-13T12:34:56Z").unwrap().with_timezone(&Local);
+        assert_eq!(message_time(&msg), Some(expected));
+        assert_eq!(message_time(&":bob!b@h PRIVMSG #test :hi\r\n".parse().unwrap()), None);
+        assert_eq!(timestamped(expected, "x"), format!("[{}] x", expected.format("%H:%M")));
     }
 
     #[test]
