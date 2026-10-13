@@ -144,9 +144,10 @@ impl MainFrame {
                     nickname: config.nickname.clone(),
                     username: config.username.clone(),
                     realname: config.realname.clone(),
+                    log: config.log,
                 };
                 if let Some(new) = edit_settings(&frame, &current) {
-                    let config = Config { nickname: new.nickname, username: new.username, realname: new.realname, ..config };
+                    let config = Config { nickname: new.nickname, username: new.username, realname: new.realname, log: new.log, ..config };
                     if let Err(e) = config.save() {
                         message(&frame, &format!("Couldn't save settings:\n\n{e}"));
                     }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "irctest.toml";
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Used for every server whose own nickname is blank.
@@ -17,7 +17,21 @@ pub struct Config {
     pub username: String,
     /// Blank = use the nickname.
     pub realname: String,
+    /// Write conversations to `logs/<server>/<target>/YYYY-MM-DD.log`.
+    pub log: bool,
     pub servers: Vec<ServerConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            nickname: String::new(),
+            username: String::new(),
+            realname: String::new(),
+            log: true,
+            servers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +158,7 @@ mod tests {
             nickname: "tyler".into(),
             username: String::new(),
             realname: "Tyler".into(),
+            log: false,
             servers: vec![ServerConfig {
                 name: "lan".into(),
                 host: "10.0.0.2".into(),
@@ -189,6 +204,7 @@ mod tests {
         assert!(!server.auto_connect);
         assert!(server.connect_commands.is_empty());
         assert_eq!(config.username, "");
+        assert!(config.log);
     }
 
     #[test]

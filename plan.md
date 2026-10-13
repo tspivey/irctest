@@ -259,9 +259,37 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - Output is capped at 10,000 lines per tab (`MAX_LINES` in `ui/tab.rs`); the oldest lines are removed and the caret/selection shift with the text so they stay on the same words.
 - **Tested:** fake localhost server dropping the first connection → reconnected 5 s later, registered, and `/quit` didn't reconnect. LAN: bob's query tab renamed to bobby on NICK and bobby's next message used it; Up/Up/Up/Down/Down recalled "second line", "first line", (nothing older), "second line", "draft"; Ctrl+F4 closed `#test` and refused the server tab. With `MAX_LINES` temporarily 20: 35 lines left exactly 20, and the caret stayed on the same line.
 
+### Step 9 — Logging
+- Path: `logs/<server>/<target>/YYYY-MM-DD.log`, relative to the current directory (like `irctest.toml`).
+  - `<server>` is the server's `name` from the config.
+  - `<target>` is the channel name (with its `#`), the other person's nick for a query (routing already gives `bob` both for bob's messages and our echoed ones to him), or `server` for the server tab.
+  - The date is the local date of the message's time (server-time tag if present, else now), so ZNC playback lands in the right day's file and files roll over at local midnight.
+- `sanitize(name)`, applied to both the server name and the target:
+  - `< > : " / \ | ? *` and control characters (0–31) become `_` (`bob|away` → `bob_away`).
+  - Trailing dots and spaces become `_` (covers `.` and `..`).
+  - Reserved device names (`CON PRN AUX NUL COM1–9 LPT1–9`, any case, also with an extension like `nul.foo`) get a `_` appended. `nul` and `con` are valid nicks.
+  - An empty name becomes `_`.
+  - Accepted collisions: `bob|x` / `bob_x` share a folder. `#Test` / `#test` share one too (Windows ignores case), which is what we want. A query with someone nicked `server` shares the server tab's folder.
+- What's logged:
+  - Every line that goes through `State::line_at`, as shown in the output box but stamped `[HH:MM:SS]`, and run through `strip_formatting` (most text is already stripped by `format_message`, but a few lines like `-> bob: text` skip it).
+  - `/msg bob hi` with no bob tab open is also logged as a normal line in bob's query log, so the logger is keyed by (server, target), not by tab.
+  - Toggle feedback written in place of speech (`feedback()`) isn't logged.
+- `src/log.rs`:
+  - `sanitize` and `log_path(server, target, date)`, both unit tested.
+  - `Logger` holds open files keyed by path with the date each was opened for. `write(server, target, time, line)` creates folders as needed, opens files in append mode, reopens on a date change, and flushes every line.
+  - Handles are dropped when a tab closes or a query is renamed on a nick change, so later lines go to the new nick's folder.
+- Errors: the first write failure is shown in the server tab ("Logging failed: ..."). Later failures are silent, and logging keeps trying.
+- Config: global `log = true` (default on), a "Log conversations" checkbox in the settings dialog.
+- `.gitignore`: add `/logs`.
+
+**Done.**
+- `src/log.rs`: `sanitize`, `log_folder`, `log_path`, `Logger` (`write` / `close` / `close_all`), with unit tests for names, reserved names, paths, the day rollover, case-insensitive folders and colour stripping.
+- `State::line_at` shows and logs. `show` only displays (toggle feedback, the "Logging failed" note). `log` writes when `config.log` is on. `remove_tab` and `rename_tab` close the tab's file. Turning logging off in Settings closes every file.
+- `Config::log` defaults to true (a manual `Default` impl, also used for fields missing from the file). Settings has a "Log conversations" checkbox.
+- **Tested:** the app against a fake localhost server, with the server named `fake:net`. It wrote `logs/fake_net/{server,#Test,bob,bob_away,nul_}/2026-10-13.log`. Colour and bold codes were stripped, the ACTION went to bob's query log, and "Disconnected" went to every tab's log. Not tested yet: `/msg` without a tab, and the Settings checkbox.
+
 ### Later
 - SASL PLAIN. The crate has no built-in SASL, so we'd send `CAP REQ :sasl` / `AUTHENTICATE` ourselves and replace `identify()` with our own registration sequence (it sends `CAP END` immediately).
-- Optional logging to files.
 - Nick list, tab completion of nicks.
 - Request `server-time` and suppress speech for ZNC playback buffer.
 

@@ -11,6 +11,7 @@ use irctest::commands::{Input, parse_input};
 use irctest::config::{Config, ServerConfig};
 use irctest::format::{format_message, message_time, parse_ctcp, spoken_channel, strip_formatting, timestamped};
 use irctest::history::History;
+use irctest::log::{Logger, SERVER_TARGET};
 use irctest::net::{self, EventSink, NetEvent, ServerId};
 use irctest::route::{Route, irc_eq, irc_lower, route};
 use irctest::speech::{Speech, mentions, should_speak};
@@ -78,6 +79,9 @@ pub struct State {
     speech: Speech,
     /// Whether the "speech isn't available" note has been shown (once, in the first server tab).
     speech_error_shown: bool,
+    logger: Logger,
+    /// Whether a log write has failed and been reported (once; later failures are silent).
+    log_error_shown: bool,
     /// For binding input boxes of new tabs back to this state.
     me: Weak<RefCell<State>>,
 }
@@ -96,6 +100,8 @@ impl State {
                 placeholder: Some(placeholder),
                 speech: Speech::new(),
                 speech_error_shown: false,
+                logger: Logger::default(),
+                log_error_shown: false,
                 me: me.clone(),
             })
         })
@@ -108,6 +114,9 @@ impl State {
     /// New settings or server list. Servers already connected keep their old settings until
     /// they reconnect.
     pub fn set_config(&mut self, config: Config) {
+        if !config.log {
+            self.logger.close_all();
+        }
         self.config = config;
     }
 
@@ -299,7 +308,7 @@ impl State {
     /// written to the tab instead so there's still some feedback.
     fn feedback(&mut self, s: usize, t: usize, text: &str) {
         if self.speech.error.is_some() {
-            self.line(s, t, text);
+            self.show(s, t, Local::now(), text);
         } else {
             self.speech.say(text, true);
         }
@@ -393,6 +402,7 @@ impl State {
     }
 
     fn remove_tab(&mut self, s: usize, t: usize) {
+        self.close_log(s, t);
         let page = self.page_index(s, t);
         let removed = self.servers[s].tabs.remove(t);
         self.notebook.remove_page(page);
@@ -432,6 +442,7 @@ impl State {
 
     /// A query tab's nick changed: new name and label.
     fn rename_tab(&mut self, s: usize, t: usize, name: &str) {
+        self.close_log(s, t);
         self.servers[s].tabs[t].name = name.to_string();
         set_page_text(&self.notebook, self.page_index(s, t), name);
     }
@@ -457,13 +468,41 @@ impl State {
         None
     }
 
-    /// Appends a line stamped with the current time.
-    fn line(&self, s: usize, t: usize, text: &str) {
+    /// Appends a line stamped with the current time, and logs it.
+    fn line(&mut self, s: usize, t: usize, text: &str) {
         self.line_at(s, t, Local::now(), text);
     }
 
-    fn line_at(&self, s: usize, t: usize, time: DateTime<Local>, text: &str) {
+    fn line_at(&mut self, s: usize, t: usize, time: DateTime<Local>, text: &str) {
+        self.show(s, t, time, text);
+        let target = log_target(&self.servers[s].tabs[t]).to_string();
+        self.log(s, &target, time, text);
+    }
+
+    /// Appends a line without logging it.
+    fn show(&self, s: usize, t: usize, time: DateTime<Local>, text: &str) {
         self.servers[s].tabs[t].tab.append_line(&timestamped(time, text));
+    }
+
+    /// Writes a line to `target`'s log, if logging is on. The first failure is shown in the
+    /// server tab; later ones are silent.
+    fn log(&mut self, s: usize, target: &str, time: DateTime<Local>, text: &str) {
+        if !self.config.log {
+            return;
+        }
+        let server = &self.servers[s].config.name;
+        if let Err(e) = self.logger.write(server, target, time, text)
+            && !self.log_error_shown
+        {
+            self.log_error_shown = true;
+            self.show(s, 0, Local::now(), &format!("Logging failed: {e}"));
+        }
+    }
+
+    /// Closes a tab's log file (the tab is going away or being renamed).
+    fn close_log(&mut self, s: usize, t: usize) {
+        let target = log_target(&self.servers[s].tabs[t]).to_string();
+        self.logger.close(&self.servers[s].config.name, &target);
     }
 
     // ---- network events ------------------------------------------------------------------
@@ -733,7 +772,10 @@ impl State {
                 dest
             }
             None => {
-                self.line(s, t, &format!("-> {target}: {text}"));
+                // Shown where it was typed, but logged with the rest of that conversation.
+                let now = Local::now();
+                self.show(s, t, now, &format!("-> {target}: {text}"));
+                self.log(s, target, now, &formatted.text);
                 t
             }
         };
@@ -766,6 +808,14 @@ impl State {
 }
 
 /// Wires a tab's input box: Enter to `State::handle_input`, Up/Down to `State::recall`.
+/// The name a tab's log folder is made from.
+fn log_target(tab: &ChatTab) -> &str {
+    match tab.kind {
+        TabKind::Server => SERVER_TARGET,
+        TabKind::Channel | TabKind::Query => &tab.name,
+    }
+}
+
 fn bind_input(state: Weak<RefCell<State>>, id: TabId, tab: &Tab) {
     let input = tab.input;
     let keys_state = state.clone();

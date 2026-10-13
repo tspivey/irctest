@@ -1,4 +1,4 @@
-//! Global settings: nickname, username, real name.
+//! Global settings: nickname, username, real name, logging.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -12,6 +12,7 @@ pub struct Settings {
     pub nickname: String,
     pub username: String,
     pub realname: String,
+    pub log: bool,
 }
 
 /// Shows the dialog; `Some` with the new settings if the user pressed OK.
@@ -34,6 +35,9 @@ pub fn edit_settings(parent: &dyn WxWidget, current: &Settings) -> Option<Settin
         &current.realname,
         TextCtrlStyle::Default,
     );
+    let log = CheckBox::builder(&dialog).with_label("&Log conversations").build();
+    log.set_value(current.log);
+    sizer.add(&log, 0, SizerFlag::All, 6);
     nickname.set_min_size(Size::new(320, -1));
 
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
@@ -51,6 +55,7 @@ pub fn edit_settings(parent: &dyn WxWidget, current: &Settings) -> Option<Settin
             nickname: nickname.get_value().trim().to_string(),
             username: username.get_value().trim().to_string(),
             realname: realname.get_value().trim().to_string(),
+            log: log.get_value(),
         });
         dialog.end_modal(ID_OK);
     });
