@@ -10,6 +10,7 @@ use irc::proto::{ChannelExt, Command, Message, Prefix, Response};
 use irctest::commands::{Input, parse_input};
 use irctest::config::{Config, ServerConfig};
 use irctest::format::{format_message, message_time, parse_ctcp, spoken_channel, strip_formatting, timestamped};
+use irctest::history::History;
 use irctest::net::{self, EventSink, NetEvent, ServerId};
 use irctest::route::{Route, irc_eq, irc_lower, route};
 use irctest::speech::{Speech, mentions, should_speak};
@@ -17,7 +18,7 @@ use tokio::runtime::Handle;
 use tokio::task::AbortHandle;
 use wxdragon::prelude::*;
 
-use super::tab::Tab;
+use super::tab::{Tab, set_page_text};
 
 pub type TabId = u64;
 
@@ -40,6 +41,8 @@ pub struct ChatTab {
     joined: bool,
     /// Channels: who's in it, as `irc_lower` nicks. Used to route QUIT and NICK.
     nicks: HashSet<String>,
+    /// Lines typed into this tab, for Up/Down.
+    history: History,
 }
 
 pub struct Server {
@@ -54,6 +57,12 @@ pub struct Server {
     tabs: Vec<ChatTab>,
     /// `irc_lower` channels we asked to join, whose tabs get selected when the JOIN arrives.
     pending_select: HashSet<String>,
+    /// The user disconnected on purpose (/quit, Server → Disconnect): don't reconnect.
+    user_quit: bool,
+    /// Reconnect attempts since the last successful registration, for the backoff.
+    attempts: u32,
+    /// One-shot timer for the next automatic reconnect; running while one is pending.
+    reconnect_timer: Timer<Notebook>,
 }
 
 pub struct State {
@@ -114,7 +123,7 @@ impl State {
         }
     }
 
-    /// Connects to a server, reusing its tabs (matched by name) if it had them.
+    /// Connects to a server (user's request), reusing its tabs (matched by name) if it had them.
     pub fn connect(&mut self, server_config: ServerConfig) {
         let s = match self.servers.iter().position(|s| irc_eq(&s.config.name, &server_config.name)) {
             Some(s) => {
@@ -123,24 +132,89 @@ impl State {
             }
             None => self.add_server(server_config.clone()),
         };
-
-        let server = &mut self.servers[s];
-        if server.task.is_some() {
+        if self.servers[s].task.is_some() {
             self.line(s, 0, "Already connected.");
             return;
         }
-        server.config = server_config;
+        self.servers[s].config = server_config;
+        self.reset_reconnect(s);
+        self.start(s);
+    }
+
+    /// Opens the connection with the server's current settings, unless one is already open.
+    fn start(&mut self, s: usize) {
+        let server = &mut self.servers[s];
+        if server.task.is_some() {
+            return;
+        }
         let nick = self.config.effective_nick(&server.config).to_string();
         let text = format!("Connecting to {}:{} as {nick}...", server.config.host, server.config.port);
         server.task = Some(net::connect(&self.runtime, server.id, &self.config, &server.config, self.sink.clone()));
         self.line(s, 0, &text);
     }
 
-    /// Disconnects the server of the selected tab: QUIT if connected, or cancels a connect
-    /// still in progress. Errors are messages for the user.
+    /// The user is taking charge (connect, reconnect): forget any earlier quit and backoff.
+    fn reset_reconnect(&mut self, s: usize) {
+        let server = &mut self.servers[s];
+        server.user_quit = false;
+        server.attempts = 0;
+        server.reconnect_timer.stop();
+    }
+
+    /// The server's settings as they are now in the config (it may have been edited since it
+    /// connected), falling back to the settings it last used.
+    fn refresh_server_config(&mut self, s: usize) {
+        let name = &self.servers[s].config.name;
+        if let Some(config) = self.config.servers.iter().find(|c| irc_eq(&c.name, name)).cloned() {
+            self.servers[s].config = config;
+        }
+    }
+
+    /// Server → Reconnect: drop the selected tab's server connection (if any) and connect again
+    /// now, with the latest settings.
+    pub fn reconnect_current(&mut self) -> Result<(), String> {
+        let (s, _) = self.current_tab().ok_or("There's no server to reconnect.")?;
+        self.reset_reconnect(s);
+        if let Some(task) = self.servers[s].task.take() {
+            // Killed outright, so no Disconnected event will come.
+            task.abort();
+            self.mark_disconnected(s, "Disconnected: reconnecting.");
+        }
+        self.refresh_server_config(s);
+        self.start(s);
+        Ok(())
+    }
+
+    /// Waits before reconnecting: 5 seconds, doubling each attempt, at most 5 minutes.
+    fn schedule_reconnect(&mut self, s: usize) {
+        let server = &mut self.servers[s];
+        let delay = net::reconnect_delay(server.attempts);
+        server.attempts += 1;
+        server.reconnect_timer.start(delay.as_millis() as i32, true);
+        self.line(s, 0, &format!("Reconnecting in {} seconds...", delay.as_secs()));
+    }
+
+    /// The reconnect timer fired.
+    fn reconnect_due(&mut self, id: ServerId) {
+        let Some(s) = self.servers.iter().position(|server| server.id == id) else { return };
+        if self.servers[s].user_quit || self.servers[s].task.is_some() {
+            return;
+        }
+        self.refresh_server_config(s);
+        self.start(s);
+    }
+
+    /// Disconnects the server of the selected tab: QUIT if connected, cancels a connect still
+    /// in progress, or cancels a pending reconnect. Errors are messages for the user.
     pub fn disconnect_current(&mut self) -> Result<(), String> {
         let (s, _) = self.current_tab().ok_or("There's no server to disconnect.")?;
         let server = &mut self.servers[s];
+        server.user_quit = true;
+        if server.task.is_none() && server.reconnect_timer.is_running() {
+            server.reconnect_timer.stop();
+            self.line(s, 0, "Reconnect cancelled.");
+            return Ok(());
+        }
         if let Some(sender) = &server.sender {
             sender.send_quit("").map_err(|e| format!("Couldn't send QUIT: {e}"))?;
             self.line(s, 0, "Disconnecting...");
@@ -163,6 +237,13 @@ impl State {
         let id = self.next_server_id;
         self.next_server_id += 1;
         let label = if config.name.is_empty() { config.host.clone() } else { config.name.clone() };
+        let reconnect_timer = Timer::new(&self.notebook);
+        let me = self.me.clone();
+        reconnect_timer.on_tick(move |_| {
+            if let Some(state) = me.upgrade() {
+                state.borrow_mut().reconnect_due(id);
+            }
+        });
         self.servers.push(Server {
             id,
             config,
@@ -171,6 +252,9 @@ impl State {
             nick: String::new(),
             tabs: Vec::new(),
             pending_select: HashSet::new(),
+            user_quit: false,
+            attempts: 0,
+            reconnect_timer,
         });
         let s = self.servers.len() - 1;
         let t = self.insert_tab(s, TabKind::Server, &label, true);
@@ -297,6 +381,7 @@ impl State {
                 speech: kind != TabKind::Server,
                 joined: false,
                 nicks: HashSet::new(),
+                history: History::default(),
             },
         );
         t
@@ -320,6 +405,46 @@ impl State {
                 self.servers[s].tabs[t].tab.input.set_focus();
             }
         }
+    }
+
+    /// /close or Ctrl+F4: parts a channel (if we're in it) and removes the tab. Server tabs stay.
+    fn close_tab(&mut self, s: usize, t: usize) {
+        match self.servers[s].tabs[t].kind {
+            TabKind::Server => self.complain(s, t, "The server tab can't be closed. Use /quit to disconnect."),
+            TabKind::Channel => {
+                if self.servers[s].tabs[t].joined {
+                    if let Some(sender) = self.servers[s].sender.clone() {
+                        let _ = net::send_raw(&sender, &format!("PART {}", self.servers[s].tabs[t].name));
+                    }
+                }
+                self.remove_tab(s, t);
+            }
+            TabKind::Query => self.remove_tab(s, t),
+        }
+    }
+
+    /// Ctrl+F4 on the selected tab.
+    pub fn close_current(&mut self) {
+        if let Some((s, t)) = self.current_tab() {
+            self.close_tab(s, t);
+        }
+    }
+
+    /// A query tab's nick changed: new name and label.
+    fn rename_tab(&mut self, s: usize, t: usize, name: &str) {
+        self.servers[s].tabs[t].name = name.to_string();
+        set_page_text(&self.notebook, self.page_index(s, t), name);
+    }
+
+    /// Up/Down in an input box: recall an earlier line. Not spoken here: NVDA reads the new
+    /// text itself.
+    fn recall(&mut self, id: TabId, up: bool) {
+        let Some((s, t)) = self.locate(id) else { return };
+        let tab = &mut self.servers[s].tabs[t];
+        let recalled = if up { tab.history.up(&tab.tab.input.get_value()) } else { tab.history.down() };
+        let Some(text) = recalled else { return };
+        tab.tab.input.set_value(&text);
+        tab.tab.input.set_insertion_point_end();
     }
 
     fn page_to_tab(&self, mut page: usize) -> Option<(usize, usize)> {
@@ -353,7 +478,12 @@ impl State {
             NetEvent::Message(msg) => self.handle_message(s, &msg),
             NetEvent::NickChanged(nick) => self.servers[s].nick = nick,
             NetEvent::Error(e) => self.line(s, 0, &format!("Error: {e}")),
-            NetEvent::Disconnected(reason) => self.mark_disconnected(s, &format!("Disconnected: {reason}")),
+            NetEvent::Disconnected { reason, retry } => {
+                self.mark_disconnected(s, &format!("Disconnected: {reason}"));
+                if retry && !self.servers[s].user_quit {
+                    self.schedule_reconnect(s);
+                }
+            }
         }
     }
 
@@ -373,6 +503,10 @@ impl State {
     }
 
     fn handle_message(&mut self, s: usize, msg: &Message) {
+        if matches!(msg.command, Command::Response(Response::RPL_WELCOME, _)) {
+            // Registered: the next drop starts the backoff from the beginning.
+            self.servers[s].attempts = 0;
+        }
         let me = self.servers[s].nick.clone();
         if let Some(formatted) = format_message(msg) {
             let time = message_time(msg).unwrap_or_else(Local::now);
@@ -456,6 +590,14 @@ impl State {
                 }
             }
             Command::NICK(new) => {
+                // Their query tab follows them, unless the new nick already has one.
+                if !is_me(source) {
+                    if let (Some(t), None) = (self.find_tab(s, source), self.find_tab(s, new)) {
+                        if self.servers[s].tabs[t].kind == TabKind::Query {
+                            self.rename_tab(s, t, new);
+                        }
+                    }
+                }
                 let (old, new) = (irc_lower(source), irc_lower(new));
                 for tab in &mut self.servers[s].tabs {
                     if tab.nicks.remove(&old) {
@@ -497,6 +639,7 @@ impl State {
 
     pub fn handle_input(&mut self, id: TabId, line: &str) {
         let Some((s, t)) = self.locate(id) else { return };
+        self.servers[s].tabs[t].history.push(line);
         let Some(input) = parse_input(line) else { return };
         let kind = self.servers[s].tabs[t].kind;
         let target = self.servers[s].tabs[t].name.clone();
@@ -548,25 +691,18 @@ impl State {
             }
             Input::Quit(reason) => {
                 if let Some(sender) = self.sender_or_complain(s, t) {
+                    self.servers[s].user_quit = true;
                     if let Err(e) = sender.send_quit(reason.unwrap_or_default()) {
                         self.complain(s, t, &format!("Couldn't send: {e}"));
                     }
                 }
             }
-            Input::Close => match kind {
-                TabKind::Server => self.complain(s, t, "The server tab can't be closed. Use /quit to disconnect."),
-                TabKind::Channel => {
-                    if self.servers[s].tabs[t].joined {
-                        if let Some(sender) = self.servers[s].sender.clone() {
-                            let _ = net::send_raw(&sender, &format!("PART {target}"));
-                        }
-                    }
-                    self.remove_tab(s, t);
-                }
-                TabKind::Query => self.remove_tab(s, t),
-            },
+            Input::Close => self.close_tab(s, t),
             Input::Raw(line) => {
                 if let Some(sender) = self.sender_or_complain(s, t) {
+                    if line.split_whitespace().next().is_some_and(|c| c.eq_ignore_ascii_case("QUIT")) {
+                        self.servers[s].user_quit = true;
+                    }
                     self.send_raw(s, t, &sender, &line);
                 }
             }
@@ -629,9 +765,26 @@ impl State {
     }
 }
 
-/// Wires Enter in a tab's input box to `State::handle_input`.
+/// Wires a tab's input box: Enter to `State::handle_input`, Up/Down to `State::recall`.
 fn bind_input(state: Weak<RefCell<State>>, id: TabId, tab: &Tab) {
     let input = tab.input;
+    let keys_state = state.clone();
+    tab.input.on_key_down(move |event| {
+        if let WindowEventData::Keyboard(key) = &event {
+            let plain = !key.control_down() && !key.shift_down() && !key.alt_down();
+            let up = match key.get_key_code() {
+                Some(WXK_UP) if plain => Some(true),
+                Some(WXK_DOWN) if plain => Some(false),
+                _ => None,
+            };
+            if let (Some(up), Some(state)) = (up, keys_state.upgrade()) {
+                event.skip(false);
+                state.borrow_mut().recall(id, up);
+                return;
+            }
+        }
+        event.skip(true);
+    });
     tab.input.on_text_enter(move |event| {
         // Mark Enter as handled; otherwise it reaches the edit control's default handling,
         // which beeps.

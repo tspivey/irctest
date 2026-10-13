@@ -4,6 +4,7 @@
 //! `irc::client::Sender` handed over in [`NetEvent::Connected`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use irc::client::prelude::{Client, Command, Config as IrcConfig, Message, Response, Sender};
@@ -26,7 +27,8 @@ pub enum NetEvent {
     /// Something went wrong but the connection is still up (e.g. an unparseable line).
     Error(String),
     /// The connection is gone, or never came up. Always the last event.
-    Disconnected(String),
+    /// `retry` is false when reconnecting wouldn't help (no nick set, every nick in use).
+    Disconnected { reason: String, retry: bool },
 }
 
 pub type EventSink = Arc<dyn Fn(ServerId, NetEvent) + Send + Sync>;
@@ -38,11 +40,11 @@ pub fn connect(handle: &Handle, id: ServerId, config: &Config, server: &ServerCo
     let connect_commands = server.connect_commands.clone();
     handle
         .spawn(async move {
-            let reason = match irc_config {
+            let (reason, retry) = match irc_config {
                 Ok(cfg) => run(id, cfg, connect_commands, &sink).await,
-                Err(e) => e,
+                Err(e) => (e, false),
             };
-            sink(id, NetEvent::Disconnected(reason));
+            sink(id, NetEvent::Disconnected { reason, retry });
         })
         .abort_handle()
 }
@@ -71,18 +73,18 @@ pub fn irc_config(config: &Config, server: &ServerConfig) -> Result<IrcConfig, S
     })
 }
 
-/// Runs one connection until it ends; returns the reason.
-async fn run(id: ServerId, cfg: IrcConfig, connect_commands: Vec<String>, sink: &EventSink) -> String {
+/// Runs one connection until it ends; returns the reason and whether a reconnect makes sense.
+async fn run(id: ServerId, cfg: IrcConfig, connect_commands: Vec<String>, sink: &EventSink) -> (String, bool) {
     let mut client = match Client::from_config(cfg).await {
         Ok(c) => c,
-        Err(e) => return format!("Couldn't connect: {e}"),
+        Err(e) => return (format!("Couldn't connect: {}", describe(&e)), true),
     };
     if let Err(e) = client.identify() {
-        return format!("Couldn't register: {e}");
+        return (format!("Couldn't register: {}", describe(&e)), true);
     }
     let mut stream = match client.stream() {
         Ok(s) => s,
-        Err(e) => return e.to_string(),
+        Err(e) => return (describe(&e), true),
     };
     sink(id, NetEvent::Connected(client.sender()));
 
@@ -111,11 +113,27 @@ async fn run(id: ServerId, cfg: IrcConfig, connect_commands: Vec<String>, sink: 
             Err(IrcError::InvalidMessage { string, cause }) => {
                 sink(id, NetEvent::Error(format!("Couldn't parse {:?}: {cause}", string.trim_end())));
             }
-            Err(IrcError::NoUsableNick) => return "Every nickname is in use.".into(),
-            Err(e) => return e.to_string(),
+            Err(IrcError::NoUsableNick) => return ("Every nickname is in use.".into(), false),
+            Err(e) => return (describe(&e), true),
         }
     }
-    "Connection closed.".into()
+    ("Connection closed.".into(), true)
+}
+
+/// An error with its causes: the irc crate's own messages are vague ("an io error occurred").
+fn describe(e: &IrcError) -> String {
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        text = format!("{text}: {cause}");
+        source = cause.source();
+    }
+    text
+}
+
+/// How long to wait before reconnect attempt `attempt` (0-based): 5 s, doubling, at most 5 minutes.
+pub fn reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_secs((5u64 << attempt.min(6)).min(300))
 }
 
 /// Sends a raw line as typed by the user (`PRIVMSG #chan :hi there`).
@@ -154,6 +172,13 @@ mod tests {
         assert!(irc_config(&Config::default(), &server()).is_err());
         let config = Config { nickname: "tyler".into(), ..Config::default() };
         assert!(irc_config(&config, &ServerConfig::default()).is_err());
+    }
+
+    #[test]
+    fn reconnect_backoff() {
+        let secs: Vec<u64> = (0..9).map(|n| reconnect_delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        assert_eq!(reconnect_delay(u32::MAX).as_secs(), 300);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 pub mod commands;
 pub mod config;
 pub mod format;
+pub mod history;
 pub mod net;
 pub mod route;
 pub mod speech;

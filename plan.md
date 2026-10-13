@@ -247,9 +247,17 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 ### Step 8 — Polish
 - Reconnect on disconnect (with back-off) by building a new `Client` and replacing the stored `Sender`; menu item to reconnect now. Don't auto-reconnect after `/quit` or `NoUsableNick`.
 - Update tab labels on nick change for queries (via the `set_page_text` helper); show topic on join (`332`).
-- Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+W to close a tab; Page Up/Down in input scrolls output.
+- Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+F4 to close a tab. (No Page Up/Down scrolling from the input box: not useful with a screen reader.)
 - Input history (Up/Down in input box).
-- Limit output buffer size (trim oldest lines past N).
+- Limit output buffer size to 10,000 lines.
+
+**Done.**
+- Reconnect: `NetEvent::Disconnected { reason, retry }`; `retry` is false for config problems (no nick/host) and `NoUsableNick`. On a retryable drop, unless the user quit (`/quit`, `/raw QUIT`, Server → Disconnect), the server tab says "Reconnecting in N seconds..." and a per-server one-shot wx `Timer` reconnects after `net::reconnect_delay(attempt)`: 5 s doubling to a 5-minute cap, reset when 001 arrives. Reconnects use the server's latest settings from the config. Server → Reconnect drops the current connection (if any) and connects now; Server → Disconnect also cancels a pending reconnect. Drop reasons include the error's causes ("an io error occurred: An existing connection was forcibly closed...").
+- Query tabs follow nick changes (`set_page_text` in `ui/tab.rs`, via `wxd_Treebook_SetPageText` as decided in step 0), unless the new nick already has a tab. The server only sends NICK for people sharing a channel with us. The topic on join was already shown in step 5 (332/333).
+- Ctrl+Tab / Ctrl+Shift+Tab already worked: wx's notebook handles them, wraps, and focuses the new page's Message box. Ctrl+F4 is View → Close tab, same as `/close`.
+- Input history (`src/history.rs`, per tab, 100 entries, no blanks or immediate repeats): Up/Down in the Message box. The draft being typed comes back after the newest entry. The recalled text isn't spoken by us; NVDA reads it.
+- Output is capped at 10,000 lines per tab (`MAX_LINES` in `ui/tab.rs`); the oldest lines are removed and the caret/selection shift with the text so they stay on the same words.
+- **Tested:** fake localhost server dropping the first connection → reconnected 5 s later, registered, and `/quit` didn't reconnect. LAN: bob's query tab renamed to bobby on NICK and bobby's next message used it; Up/Up/Up/Down/Down recalled "second line", "first line", (nothing older), "second line", "draft"; Ctrl+F4 closed `#test` and refused the server tab. With `MAX_LINES` temporarily 20: 35 lines left exactly 20, and the caret stayed on the same line.
 
 ### Later
 - SASL PLAIN. The crate has no built-in SASL, so we'd send `CAP REQ :sasl` / `AUTHENTICATE` ourselves and replace `identify()` with our own registration sequence (it sends `CAP END` immediately).

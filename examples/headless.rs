@@ -43,7 +43,7 @@ fn main() {
         },
         NetEvent::NickChanged(nick) => println!("[{id}] our nick is now {nick}"),
         NetEvent::Error(e) => println!("[{id}] error: {e}"),
-        NetEvent::Disconnected(reason) => {
+        NetEvent::Disconnected { reason, .. } => {
             println!("[{id}] disconnected: {reason}");
             let _ = done_tx.lock().unwrap().send(());
         }

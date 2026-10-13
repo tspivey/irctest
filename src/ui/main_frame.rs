@@ -15,6 +15,8 @@ use super::state::State;
 const ID_DISCONNECT: i32 = 1000;
 const ID_MANAGE_SERVERS: i32 = 1001;
 const ID_SETTINGS: i32 = 1002;
+const ID_RECONNECT: i32 = 1003;
+const ID_CLOSE_TAB: i32 = 1103;
 const ID_TOGGLE_SPEECH: i32 = 1101;
 const ID_TOGGLE_ALL_SPEECH: i32 = 1102;
 
@@ -90,6 +92,7 @@ impl MainFrame {
         let server_menu = Menu::builder()
             .append_item(ID_MANAGE_SERVERS, "&Manage servers...\tCtrl+Shift+S", "Add, edit, delete and connect to servers")
             .append_item(ID_DISCONNECT, "&Disconnect", "Disconnect from the current tab's server")
+            .append_item(ID_RECONNECT, "&Reconnect", "Reconnect to the current tab's server now")
             .append_item(ID_SETTINGS, "Se&ttings...", "Global nickname and other settings")
             .append_separator()
             .append_item(ID_EXIT, "E&xit\tAlt+F4", "Quit irctest")
@@ -98,6 +101,8 @@ impl MainFrame {
         let view_menu = Menu::builder()
             .append_item(ID_TOGGLE_SPEECH, "Toggle &speech for this tab\tF5", "Turn speech on or off for the current tab")
             .append_item(ID_TOGGLE_ALL_SPEECH, "Toggle &all speech\tShift+F5", "Turn all speech on or off")
+            .append_separator()
+            .append_item(ID_CLOSE_TAB, "&Close tab\tCtrl+F4", "Leave the channel or close the private messages")
             .build();
 
         let help_menu = Menu::builder()
@@ -148,6 +153,13 @@ impl MainFrame {
                     state.borrow_mut().set_config(config);
                 }
             }
+            ID_RECONNECT => {
+                let result = state.borrow_mut().reconnect_current();
+                if let Err(e) = result {
+                    message(&frame, &e);
+                }
+            }
+            ID_CLOSE_TAB => state.borrow_mut().close_current(),
             ID_DISCONNECT => {
                 let result = state.borrow_mut().disconnect_current();
                 if let Err(e) = result {
