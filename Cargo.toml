@@ -1,0 +1,20 @@
+[package]
+name = "irctest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wxdragon = "0.9"
+prismer = "0.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures = "0.3"
+irc = { version = "1.1", default-features = false, features = ["ctcp", "tls-native", "encoding"] }
+
+[patch.crates-io]
+wxdragon = { git = "https://github.com/AllenDang/wxDragon" }
+wxdragon-sys = { git = "https://github.com/AllenDang/wxDragon" }
+
+[build-dependencies]
+embed-manifest = "1.4"
