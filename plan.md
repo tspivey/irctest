@@ -215,6 +215,15 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - Every control has a label and a sensible tab order (use `StaticText` before each field so screen readers pick the label up).
 - **Test:** add/edit/delete servers, restart, check `irctest.toml` and auto-connect.
 
+**Done.**
+- `ui/server_dialog.rs`: `manage_servers(parent, &Config, save) -> ManageResult { servers, connect }`. List entries read "lan (10.0.0.2:6667, TLS, auto-connect)". Tab order: list, Connect, Add, Edit, Delete, Close. Connect is the default button, so Enter on the list connects (double-click too); Connect/Edit/Delete are disabled with nothing selected. Delete asks Yes/No (No is the default). The list is saved to `irctest.toml` after every add, edit and delete rather than on close.
+- `ui/server_edit.rs`: Name, Host, Port, Use TLS, Server password (password field), Nickname, Connect automatically at startup, connect commands (multi-line, one per line); OK is the default button, Esc cancels. Checks on OK: host required, port 1–65535, name unique (blank name = host).
+- `ui/settings_dialog.rs`: Nickname, Username, Real name (blank = nickname); saved on OK.
+- Server menu: Manage servers (Ctrl+Shift+S), Disconnect (current tab's server: QUIT if connected, cancels a connect in progress), Settings, Exit. The temporary Connect item is gone.
+- `State::connect(ServerConfig)` reuses a server's tabs by name; new settings apply to a server the next time it connects. Auto-connect runs after the frame is shown, then selects the first server tab.
+- State is never borrowed while a dialog is open, since network events are handled inside the dialog's event loop.
+- **Tested via UI Automation + keyboard** (config backed up and restored): startup auto-connect; manager focus and tab order; Alt+A, fields filled by keyboard, Enter on OK → saved to `irctest.toml`; Enter on the list connected the new server with its own nick and connect commands; Disconnect; Settings shows current values and Esc closes it.
+
 ### Step 7 — Speech
 - `speech.rs` as described above; F5 / Shift+F5 menu accelerators.
 - Channel `PRIVMSG` → `"<nick> on <channel without leading #> says <text>"`. ACTION → `"<nick> on <channel> <action>"`. Query → `"<nick> says <text>"` (privately).

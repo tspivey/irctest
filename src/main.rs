@@ -18,7 +18,11 @@ fn main() {
     let handle = runtime.handle().clone();
 
     let _ = wxdragon::main(move |_| match Config::load() {
-        Ok(config) => ui::main_frame::MainFrame::new(config, handle).show(),
+        Ok(config) => {
+            let main = ui::main_frame::MainFrame::new(config, handle);
+            main.show();
+            main.connect_auto();
+        }
         Err(e) => {
             // Don't start with defaults: a later save would overwrite the user's file.
             let frame = Frame::builder().with_title("irctest").build();

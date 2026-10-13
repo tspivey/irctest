@@ -7,10 +7,12 @@ use irctest::net::{EventSink, NetEvent, ServerId};
 use tokio::runtime::Handle;
 use wxdragon::prelude::*;
 
+use super::server_dialog::manage_servers;
+use super::settings_dialog::{Settings, edit_settings};
 use super::state::State;
 
 // Menu item ids. wx's stock ids are used where one exists.
-const ID_CONNECT: i32 = 1000;
+const ID_DISCONNECT: i32 = 1000;
 const ID_MANAGE_SERVERS: i32 = 1001;
 const ID_SETTINGS: i32 = 1002;
 const ID_TOGGLE_SPEECH: i32 = 1101;
@@ -79,10 +81,15 @@ impl MainFrame {
         self.frame.centre();
     }
 
+    /// Connects the servers marked auto-connect. Call after `show`.
+    pub fn connect_auto(&self) {
+        self.state.borrow_mut().connect_auto();
+    }
+
     fn build_menus(&self) {
         let server_menu = Menu::builder()
-            .append_item(ID_CONNECT, "&Connect", "Connect to the first server in irctest.toml")
             .append_item(ID_MANAGE_SERVERS, "&Manage servers...\tCtrl+Shift+S", "Add, edit, delete and connect to servers")
+            .append_item(ID_DISCONNECT, "&Disconnect", "Disconnect from the current tab's server")
             .append_item(ID_SETTINGS, "Se&ttings...", "Global nickname and other settings")
             .append_separator()
             .append_item(ID_EXIT, "E&xit\tAlt+F4", "Quit irctest")
@@ -110,9 +117,39 @@ impl MainFrame {
         let frame = self.frame;
         let state = self.state.clone();
         self.frame.on_menu_selected(move |event: MenuEventData| match event.get_id() {
-            ID_CONNECT => {
-                // Bind the result first so the state borrow ends before any dialog runs.
-                let result = state.borrow_mut().connect_first();
+            // State is never borrowed while a dialog runs: network events are handled during
+            // the dialog's event loop and need to borrow it.
+            ID_MANAGE_SERVERS => {
+                let config = state.borrow().config().clone();
+                let saved = config.clone();
+                let result = manage_servers(&frame, &config, move |servers| {
+                    let config = Config { servers: servers.to_vec(), ..saved.clone() };
+                    config.save().map_err(|e| e.to_string())
+                });
+                let config = Config { servers: result.servers, ..config };
+                let connect = result.connect.map(|i| config.servers[i].clone());
+                state.borrow_mut().set_config(config);
+                if let Some(server) = connect {
+                    state.borrow_mut().connect(server);
+                }
+            }
+            ID_SETTINGS => {
+                let config = state.borrow().config().clone();
+                let current = Settings {
+                    nickname: config.nickname.clone(),
+                    username: config.username.clone(),
+                    realname: config.realname.clone(),
+                };
+                if let Some(new) = edit_settings(&frame, &current) {
+                    let config = Config { nickname: new.nickname, username: new.username, realname: new.realname, ..config };
+                    if let Err(e) = config.save() {
+                        message(&frame, &format!("Couldn't save settings:\n\n{e}"));
+                    }
+                    state.borrow_mut().set_config(config);
+                }
+            }
+            ID_DISCONNECT => {
+                let result = state.borrow_mut().disconnect_current();
                 if let Err(e) = result {
                     message(&frame, &e);
                 }
@@ -121,7 +158,7 @@ impl MainFrame {
                 frame.close(true);
             }
             ID_ABOUT => message(&frame, "irctest: an accessible IRC client."),
-            ID_MANAGE_SERVERS | ID_SETTINGS | ID_TOGGLE_SPEECH | ID_TOGGLE_ALL_SPEECH => {
+            ID_TOGGLE_SPEECH | ID_TOGGLE_ALL_SPEECH => {
                 message(&frame, "Not implemented yet.")
             }
             _ => event.skip(true),

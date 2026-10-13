@@ -86,26 +86,71 @@ impl State {
         })
     }
 
-    /// Temporary until the server manager (step 6): connect to the first configured server.
-    pub fn connect_first(&mut self) -> Result<(), String> {
-        let server_config = self.config.servers.first().cloned().ok_or("There are no servers in irctest.toml.")?;
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
 
-        // Reuse the server's tabs if it has them.
-        let s = match self.servers.iter().position(|s| s.config.name == server_config.name) {
-            Some(s) => s,
-            None => self.add_server(server_config),
+    /// New settings or server list. Servers already connected keep their old settings until
+    /// they reconnect.
+    pub fn set_config(&mut self, config: Config) {
+        self.config = config;
+    }
+
+    /// Connects every server marked auto-connect.
+    pub fn connect_auto(&mut self) {
+        let servers: Vec<ServerConfig> = self.config.servers.iter().filter(|s| s.auto_connect).cloned().collect();
+        for server in servers {
+            self.connect(server);
+        }
+        // Each new server tab took the selection; start on the first one instead.
+        if !self.servers.is_empty() {
+            self.select_tab(0, 0);
+        }
+    }
+
+    /// Connects to a server, reusing its tabs (matched by name) if it had them.
+    pub fn connect(&mut self, server_config: ServerConfig) {
+        let s = match self.servers.iter().position(|s| irc_eq(&s.config.name, &server_config.name)) {
+            Some(s) => {
+                self.select_tab(s, 0);
+                s
+            }
+            None => self.add_server(server_config.clone()),
         };
 
         let server = &mut self.servers[s];
         if server.task.is_some() {
             self.line(s, 0, "Already connected.");
-        } else {
-            let nick = self.config.effective_nick(&server.config).to_string();
-            let text = format!("Connecting to {}:{} as {nick}...", server.config.host, server.config.port);
-            server.task = Some(net::connect(&self.runtime, server.id, &self.config, &server.config, self.sink.clone()));
-            self.line(s, 0, &text);
+            return;
         }
-        Ok(())
+        server.config = server_config;
+        let nick = self.config.effective_nick(&server.config).to_string();
+        let text = format!("Connecting to {}:{} as {nick}...", server.config.host, server.config.port);
+        server.task = Some(net::connect(&self.runtime, server.id, &self.config, &server.config, self.sink.clone()));
+        self.line(s, 0, &text);
+    }
+
+    /// Disconnects the server of the selected tab: QUIT if connected, or cancels a connect
+    /// still in progress. Errors are messages for the user.
+    pub fn disconnect_current(&mut self) -> Result<(), String> {
+        let selected = self.notebook.selection();
+        let (s, _) = (selected >= 0)
+            .then(|| self.page_to_tab(selected as usize))
+            .flatten()
+            .ok_or("There's no server to disconnect.")?;
+        let server = &mut self.servers[s];
+        if let Some(sender) = &server.sender {
+            sender.send_quit("").map_err(|e| format!("Couldn't send QUIT: {e}"))?;
+            self.line(s, 0, "Disconnecting...");
+            Ok(())
+        } else if let Some(task) = server.task.take() {
+            // Still connecting: the task is killed, so no Disconnected event will come.
+            task.abort();
+            self.mark_disconnected(s, "Connection attempt cancelled.");
+            Ok(())
+        } else {
+            Err(format!("{} isn't connected.", server.config.name))
+        }
     }
 
     fn add_server(&mut self, config: ServerConfig) -> usize {
@@ -250,20 +295,22 @@ impl State {
             NetEvent::Message(msg) => self.handle_message(s, &msg),
             NetEvent::NickChanged(nick) => self.servers[s].nick = nick,
             NetEvent::Error(e) => self.line(s, 0, &format!("Error: {e}")),
-            NetEvent::Disconnected(reason) => {
-                let server = &mut self.servers[s];
-                server.sender = None;
-                server.task = None;
-                server.pending_select.clear();
-                for tab in &mut server.tabs {
-                    tab.joined = false;
-                    tab.nicks.clear();
-                }
-                let text = format!("Disconnected: {reason}");
-                for t in 0..self.servers[s].tabs.len() {
-                    self.line(s, t, &text);
-                }
-            }
+            NetEvent::Disconnected(reason) => self.mark_disconnected(s, &format!("Disconnected: {reason}")),
+        }
+    }
+
+    /// The connection is gone: forget it, mark channels parted, and say so in every tab.
+    fn mark_disconnected(&mut self, s: usize, text: &str) {
+        let server = &mut self.servers[s];
+        server.sender = None;
+        server.task = None;
+        server.pending_select.clear();
+        for tab in &mut server.tabs {
+            tab.joined = false;
+            tab.nicks.clear();
+        }
+        for t in 0..self.servers[s].tabs.len() {
+            self.line(s, t, text);
         }
     }
 
