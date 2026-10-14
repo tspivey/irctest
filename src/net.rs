@@ -1,5 +1,5 @@
-//! One tokio task per server connection: connects (with TLS if asked), registers, answers
-//! PINGs and CTCP queries, and passes every message on.
+//! One tokio task per server connection: connects (with TLS if asked), registers (logging in
+//! with SASL PLAIN if asked), answers PINGs and CTCP queries, and passes every message on.
 //!
 //! The task reports what happens through an event sink; the caller sends with the
 //! [`Sender`] handed over in [`NetEvent::Connected`].
@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use irc_proto::{Command, Message, Response};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use irc_proto::{CapSubCommand, Command, Message, Response};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
@@ -124,6 +126,10 @@ pub struct Registration {
     pub realname: String,
     /// Raw lines sent after 001.
     pub connect_commands: Vec<String>,
+    /// Account for SASL PLAIN.
+    pub sasl_username: String,
+    /// Blank = don't use SASL.
+    pub sasl_password: String,
     /// The fingerprint saved for this server; blank if none.
     pub pinned: String,
     /// Fingerprints the user accepted for this run of the program only.
@@ -151,6 +157,11 @@ impl Registration {
             username: config.effective_username(server).to_string(),
             realname: config.effective_realname(server).to_string(),
             connect_commands: server.connect_commands.clone(),
+            sasl_username: match server.sasl_username.trim() {
+                "" => nick.to_string(),
+                user => user.to_string(),
+            },
+            sasl_password: server.sasl_password.clone(),
             pinned: server.fingerprint.trim().to_string(),
             accepted: accepted.to_vec(),
         })
@@ -266,7 +277,7 @@ where
 {
     let (read, mut write) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut conn = Connection { id, sink, sender: Sender(tx), nick: reg.nick.clone(), alt_nick: 0, registered: false, closing: Arc::default(), reg };
+    let mut conn = Connection { id, sink, sender: Sender(tx), nick: reg.nick.clone(), alt_nick: 0, registered: false, sasl: Sasl::Idle, closing: Arc::default(), reg };
     let closing = conn.closing.clone();
     conn.register();
     conn.event(NetEvent::Connected(conn.sender.clone()));
@@ -300,8 +311,23 @@ struct Connection {
     alt_nick: usize,
     /// Seen 001.
     registered: bool,
+    sasl: Sasl,
     /// We sent QUIT or the server sent ERROR: the connection is about to close.
     closing: Arc<AtomicBool>,
+}
+
+/// How far SASL login has got during registration.
+#[derive(Debug, PartialEq)]
+enum Sasl {
+    /// Not using SASL, or done with it.
+    Idle,
+    /// Sent CAP LS and collecting the reply. `Some` once the server offers `sasl`, holding the
+    /// mechanisms it lists (blank if none).
+    Listing(Option<String>),
+    /// Sent CAP REQ :sasl.
+    Requested,
+    /// Sent AUTHENTICATE PLAIN.
+    Authenticating,
 }
 
 impl Connection {
@@ -314,7 +340,12 @@ impl Connection {
         let _ = self.sender.send(msg);
     }
 
-    fn register(&self) {
+    fn register(&mut self) {
+        // The server holds registration open until CAP END.
+        if !self.reg.sasl_password.is_empty() {
+            self.send(Command::CAP(None, CapSubCommand::LS, Some("302".into()), None));
+            self.sasl = Sasl::Listing(None);
+        }
         if !self.reg.password.is_empty() {
             self.send(Command::PASS(self.reg.password.clone()));
         }
@@ -387,6 +418,8 @@ impl Connection {
             Command::PING(token, _) => self.send(Command::PONG(token.clone(), None)),
             Command::Response(Response::RPL_WELCOME, args) => {
                 self.registered = true;
+                // The server didn't wait for SASL (or doesn't know CAP).
+                self.sasl = Sasl::Idle;
                 if let Some(nick) = args.first() {
                     self.set_nick(nick);
                 }
@@ -405,6 +438,15 @@ impl Connection {
                 self.send(Command::NICK(alt.clone()));
                 self.set_nick(&alt);
             }
+            Command::CAP(..) => self.handle_cap(&msg.command),
+            Command::AUTHENTICATE(data) if data == "+" && self.sasl == Sasl::Authenticating => self.send_credentials(),
+            Command::Response(Response::RPL_SASLSUCCESS | Response::ERR_SASLALREADY, _) if self.sasl != Sasl::Idle => {
+                self.end_sasl(None)
+            }
+            Command::Response(
+                Response::ERR_NICKLOCKED | Response::ERR_SASLFAIL | Response::ERR_SASLTOOLONG | Response::ERR_SASLABORT,
+                _,
+            ) if self.sasl != Sasl::Idle => self.end_sasl(Some("SASL login failed; carrying on without logging in.")),
             Command::NICK(new) if source_is_me => self.set_nick(new),
             Command::ERROR(_) => self.closing.store(true, Ordering::Relaxed),
             Command::PRIVMSG(_, body) if !source_is_me => {
@@ -419,12 +461,82 @@ impl Connection {
         None
     }
 
+    fn handle_cap(&mut self, cmd: &Command) {
+        let Some((sub, more, caps)) = cap_reply(cmd) else { return };
+        match (sub, &mut self.sasl) {
+            (CapSubCommand::LS, Sasl::Listing(offered)) => {
+                if let Some(cap) = caps.split(' ').find(|c| cap_name(c).eq_ignore_ascii_case("sasl")) {
+                    *offered = Some(cap.split_once('=').map_or("", |(_, mechs)| mechs).to_string());
+                }
+                if more {
+                    return;
+                }
+                match offered.take() {
+                    Some(mechs) if mechs.is_empty() || mechs.split(',').any(|m| m.eq_ignore_ascii_case("PLAIN")) => {
+                        self.sasl = Sasl::Requested;
+                        self.send(Command::CAP(None, CapSubCommand::REQ, None, Some("sasl".into())));
+                    }
+                    Some(_) => self.end_sasl(Some("The server doesn't accept SASL PLAIN; carrying on without logging in.")),
+                    None => self.end_sasl(Some("The server doesn't support SASL; carrying on without logging in.")),
+                }
+            }
+            (CapSubCommand::ACK, Sasl::Requested) if caps.split(' ').any(|c| c.eq_ignore_ascii_case("sasl")) => {
+                self.sasl = Sasl::Authenticating;
+                self.send(Command::AUTHENTICATE("PLAIN".into()));
+            }
+            (CapSubCommand::NAK, Sasl::Requested) => {
+                self.end_sasl(Some("The server refused SASL; carrying on without logging in."))
+            }
+            _ => {}
+        }
+    }
+
+    /// Answers the server's `AUTHENTICATE +` with the PLAIN credentials (no authorization
+    /// identity), in 400-byte pieces. A last piece of exactly 400 is followed by `+`.
+    fn send_credentials(&self) {
+        let payload = BASE64.encode(format!("\0{}\0{}", self.reg.sasl_username, self.reg.sasl_password));
+        for chunk in payload.as_bytes().chunks(400) {
+            self.send(Command::AUTHENTICATE(String::from_utf8_lossy(chunk).into_owned()));
+        }
+        if payload.len() % 400 == 0 {
+            self.send(Command::AUTHENTICATE("+".into()));
+        }
+    }
+
+    /// Finishes capability negotiation, so registration completes. `note` says why we're
+    /// carrying on without logging in.
+    fn end_sasl(&mut self, note: Option<&str>) {
+        if let Some(note) = note {
+            self.event(NetEvent::Error(note.into()));
+        }
+        self.sasl = Sasl::Idle;
+        self.send(Command::CAP(None, CapSubCommand::END, None, None));
+    }
+
     fn set_nick(&mut self, nick: &str) {
         if self.nick != nick {
             self.nick = nick.to_string();
             self.event(NetEvent::NickChanged(self.nick.clone()));
         }
     }
+}
+
+/// A CAP reply's subcommand, whether more lines follow (a `*` before the list) and the list.
+/// irc-proto puts what comes after the subcommand in the last two fields, with or without
+/// the leading target.
+fn cap_reply(cmd: &Command) -> Option<(&CapSubCommand, bool, &str)> {
+    let Command::CAP(_, sub, third, fourth) = cmd else { return None };
+    let rest: Vec<&str> = [third, fourth].into_iter().flatten().map(String::as_str).collect();
+    Some(match rest.as_slice() {
+        ["*", list] => (sub, true, list),
+        [.., list] => (sub, false, list),
+        [] => (sub, false, ""),
+    })
+}
+
+/// `sasl` from `sasl=PLAIN,EXTERNAL`.
+fn cap_name(cap: &str) -> &str {
+    cap.split('=').next().unwrap_or(cap)
 }
 
 /// A message as sent: one line, cut at any CR or LF in it so text can't smuggle in a
@@ -547,6 +659,8 @@ mod tests {
             username: "tspivey".into(),
             realname: "Tyler S".into(),
             connect_commands: Vec::new(),
+            sasl_username: String::new(),
+            sasl_password: String::new(),
             pinned: String::new(),
             accepted: Vec::new(),
         }
@@ -595,11 +709,14 @@ mod tests {
 
     impl Fake {
         fn start(password: &str, connect_commands: &[&str]) -> Self {
-            let reg = Registration {
+            Self::start_with(Registration {
                 password: password.into(),
                 connect_commands: connect_commands.iter().map(|s| s.to_string()).collect(),
                 ..test_reg()
-            };
+            })
+        }
+
+        fn start_with(reg: Registration) -> Self {
             let (client, server) = tokio::io::duplex(64 * 1024);
             let (sink, events) = channel_sink();
             let session = tokio::spawn(session(1, reg, client, sink));
@@ -649,6 +766,147 @@ mod tests {
     async fn no_pass_without_password() {
         let mut fake = Fake::start("", &[]);
         assert_eq!(fake.recv().await, "NICK tyler");
+    }
+
+    #[test]
+    fn sasl_username_falls_back_to_nick() {
+        let config = Config { nickname: "tyler".into(), ..Config::default() };
+        let reg = Registration::new(&config, &server(), &[]).unwrap();
+        assert_eq!(reg.sasl_username, "tyler");
+        assert_eq!(reg.sasl_password, "");
+        let server = ServerConfig { sasl_username: " account ".into(), sasl_password: "pw".into(), ..server() };
+        let reg = Registration::new(&config, &server, &[]).unwrap();
+        assert_eq!(reg.sasl_username, "account");
+        assert_eq!(reg.sasl_password, "pw");
+    }
+
+    /// A session logging in as `account`, read up to the start of capability negotiation.
+    async fn sasl_session(password: &str) -> Fake {
+        let mut fake = Fake::start_with(Registration {
+            sasl_username: "account".into(),
+            sasl_password: password.into(),
+            ..test_reg()
+        });
+        assert_eq!(fake.recv().await, "CAP LS 302");
+        assert_eq!(fake.recv().await, "NICK tyler");
+        assert_eq!(fake.recv().await, "USER tspivey 0 * :Tyler S");
+        assert!(matches!(fake.event().await, NetEvent::Connected(_)));
+        assert!(matches!(fake.event().await, NetEvent::NickChanged(_)));
+        fake
+    }
+
+    /// Skips events up to the next Error and returns its text.
+    async fn next_error(fake: &mut Fake) -> String {
+        loop {
+            if let NetEvent::Error(e) = fake.event().await {
+                return e;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sasl_login() {
+        let mut fake = sasl_session("secret").await;
+        // A multi-line list, with sasl on the last line.
+        fake.send(":irc.test CAP * LS * :multi-prefix away-notify").await;
+        fake.send(":irc.test CAP * LS :sasl=EXTERNAL,PLAIN server-time").await;
+        assert_eq!(fake.recv().await, "CAP REQ sasl");
+        fake.send(":irc.test CAP tyler ACK :sasl").await;
+        assert_eq!(fake.recv().await, "AUTHENTICATE PLAIN");
+        fake.send("AUTHENTICATE +").await;
+        assert_eq!(fake.recv().await, format!("AUTHENTICATE {}", BASE64.encode("\0account\0secret")));
+        fake.send(":irc.test 900 tyler tyler!t@host account :You are now logged in as account").await;
+        fake.send(":irc.test 903 tyler :SASL authentication successful").await;
+        assert_eq!(fake.recv().await, "CAP END");
+        // Only once.
+        fake.send(":irc.test 907 tyler :You have already authenticated").await;
+        fake.send("PING :x").await;
+        assert_eq!(fake.recv().await, "PONG x");
+    }
+
+    #[tokio::test]
+    async fn sasl_without_mechanism_list() {
+        let mut fake = sasl_session("secret").await;
+        fake.send(":irc.test CAP * LS :sasl").await;
+        assert_eq!(fake.recv().await, "CAP REQ sasl");
+    }
+
+    #[tokio::test]
+    async fn sasl_not_offered() {
+        let mut fake = sasl_session("secret").await;
+        fake.send(":irc.test CAP * LS :multi-prefix sasl-other").await;
+        assert_eq!(fake.recv().await, "CAP END");
+        assert_eq!(next_error(&mut fake).await, "The server doesn't support SASL; carrying on without logging in.");
+    }
+
+    #[tokio::test]
+    async fn sasl_without_plain() {
+        let mut fake = sasl_session("secret").await;
+        fake.send(":irc.test CAP * LS :sasl=EXTERNAL").await;
+        assert_eq!(fake.recv().await, "CAP END");
+        assert!(next_error(&mut fake).await.contains("PLAIN"));
+    }
+
+    #[tokio::test]
+    async fn sasl_refused() {
+        let mut fake = sasl_session("secret").await;
+        fake.send(":irc.test CAP * LS :sasl").await;
+        assert_eq!(fake.recv().await, "CAP REQ sasl");
+        fake.send(":irc.test CAP tyler NAK :sasl").await;
+        assert_eq!(fake.recv().await, "CAP END");
+        assert_eq!(next_error(&mut fake).await, "The server refused SASL; carrying on without logging in.");
+    }
+
+    #[tokio::test]
+    async fn sasl_failure_carries_on() {
+        let mut fake = sasl_session("wrong").await;
+        fake.send(":irc.test CAP * LS :sasl").await;
+        fake.recv().await;
+        fake.send(":irc.test CAP tyler ACK :sasl").await;
+        fake.recv().await;
+        fake.send("AUTHENTICATE +").await;
+        fake.recv().await;
+        fake.send(":irc.test 904 tyler :SASL authentication failed").await;
+        assert_eq!(fake.recv().await, "CAP END");
+        assert_eq!(next_error(&mut fake).await, "SASL login failed; carrying on without logging in.");
+        // A second failure numeric doesn't end negotiation again.
+        fake.send(":irc.test 904 tyler :SASL authentication failed").await;
+        fake.send("PING :x").await;
+        assert_eq!(fake.recv().await, "PONG x");
+    }
+
+    #[tokio::test]
+    async fn sasl_long_credentials_are_split() {
+        // "\0account\0" + 291 bytes = 300 bytes = exactly 400 base64 characters.
+        let mut fake = sasl_session(&"p".repeat(291)).await;
+        fake.send(":irc.test CAP * LS :sasl").await;
+        fake.recv().await;
+        fake.send(":irc.test CAP tyler ACK :sasl").await;
+        fake.recv().await;
+        fake.send("AUTHENTICATE +").await;
+        assert_eq!(fake.recv().await.len(), "AUTHENTICATE ".len() + 400);
+        assert_eq!(fake.recv().await, "AUTHENTICATE +");
+
+        let mut fake = sasl_session(&"p".repeat(300)).await;
+        fake.send(":irc.test CAP * LS :sasl").await;
+        fake.recv().await;
+        fake.send(":irc.test CAP tyler ACK :sasl").await;
+        fake.recv().await;
+        fake.send("AUTHENTICATE +").await;
+        assert_eq!(fake.recv().await.len(), "AUTHENTICATE ".len() + 400);
+        let rest = fake.recv().await;
+        assert!(rest.starts_with("AUTHENTICATE ") && rest != "AUTHENTICATE +", "{rest}");
+    }
+
+    #[tokio::test]
+    async fn welcome_ends_sasl() {
+        // A server without CAP registers us anyway; a late 904 then sends nothing.
+        let mut fake = sasl_session("secret").await;
+        fake.send(":irc.test 421 tyler CAP :Unknown command").await;
+        fake.send(":irc.test 001 tyler :Welcome").await;
+        fake.send(":irc.test 904 tyler :SASL authentication failed").await;
+        fake.send("PING :x").await;
+        assert_eq!(fake.recv().await, "PONG x");
     }
 
     #[tokio::test]

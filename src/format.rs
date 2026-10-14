@@ -79,7 +79,7 @@ pub fn format_message(msg: &Message) -> Option<Formatted> {
         }
         Command::INVITE(_, channel) => Formatted::line(format!("{source} invites you to {channel}")),
         Command::ERROR(text) => Formatted::line(format!("Error: {text}")),
-        Command::PING(..) | Command::PONG(..) | Command::CAP(..) => return None,
+        Command::PING(..) | Command::PONG(..) | Command::CAP(..) | Command::AUTHENTICATE(_) => return None,
         // Empty or prefix-only lines parse as an empty raw command.
         Command::Raw(cmd, _) if cmd.is_empty() => return None,
         // Numerics: the first parameter is our own nick, so leave it out.
@@ -102,6 +102,10 @@ pub fn format_message(msg: &Message) -> Option<Formatted> {
                 .map(|t| format!(" on {}", t.format("%Y-%m-%d %H:%M")))
                 .unwrap_or_default();
             Formatted::line(format!("Topic for {} set by {setter}{when}", args[1]))
+        }
+        // `<nick> <mask> [<account>] :You are now logged in as ...`: the text says it all.
+        Command::Response(Response::RPL_LOGGEDIN | Response::RPL_LOGGEDOUT, args) if !args.is_empty() => {
+            Formatted::line(args[args.len() - 1].clone())
         }
         Command::Response(_, args) => Formatted::line(args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ")),
         Command::Raw(cmd, args) if is_numeric(cmd) => {
@@ -224,6 +228,17 @@ mod tests {
 
     fn text(line: &str) -> String {
         fmt(line).unwrap().text
+    }
+
+    #[test]
+    fn sasl_lines() {
+        assert_eq!(
+            text(":irc.test 900 tyler tyler!t@host tyler :You are now logged in as tyler\r\n"),
+            "You are now logged in as tyler"
+        );
+        assert_eq!(text(":irc.test 903 tyler :SASL authentication successful\r\n"), "SASL authentication successful");
+        assert!(fmt("AUTHENTICATE +\r\n").is_none());
+        assert!(fmt(":irc.test CAP * LS :sasl\r\n").is_none());
     }
 
     #[test]

@@ -51,6 +51,10 @@ pub struct ServerConfig {
     /// SHA-256 fingerprint of a TLS certificate to accept even though Windows doesn't trust it
     /// (e.g. self-signed), as colon-separated hex. Blank = none.
     pub fingerprint: String,
+    /// Account to log in to with SASL PLAIN. Blank = the nickname.
+    pub sasl_username: String,
+    /// SASL is used when this isn't blank.
+    pub sasl_password: String,
 }
 
 impl Default for ServerConfig {
@@ -65,6 +69,8 @@ impl Default for ServerConfig {
             auto_connect: false,
             connect_commands: Vec::new(),
             fingerprint: String::new(),
+            sasl_username: String::new(),
+            sasl_password: String::new(),
         }
     }
 }
@@ -173,6 +179,8 @@ mod tests {
                 auto_connect: true,
                 connect_commands: vec!["JOIN #test".into(), "PRIVMSG NickServ :IDENTIFY x".into()],
                 fingerprint: "AB:CD".into(),
+                sasl_username: "account".into(),
+                sasl_password: "secret".into(),
             }],
         }
     }
@@ -209,6 +217,7 @@ mod tests {
         assert!(!server.auto_connect);
         assert!(server.connect_commands.is_empty());
         assert_eq!(server.fingerprint, "");
+        assert_eq!(server.sasl_password, "");
         assert_eq!(config.username, "");
         assert!(config.log);
     }

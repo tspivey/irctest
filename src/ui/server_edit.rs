@@ -66,6 +66,20 @@ pub fn edit_server(parent: &dyn WxWidget, title: &str, server: &ServerConfig, ot
         &server.nickname,
         TextCtrlStyle::Default,
     );
+    let sasl_username = labeled_text(
+        &dialog,
+        &sizer,
+        "SASL &username (leave blank to use the nickname)",
+        &server.sasl_username,
+        TextCtrlStyle::Default,
+    );
+    let sasl_password = labeled_text(
+        &dialog,
+        &sizer,
+        "SASL p&assword (leave blank to not use SASL)",
+        &server.sasl_password,
+        TextCtrlStyle::Password,
+    );
     let auto_connect = CheckBox::builder(&dialog).with_label("&Connect automatically at startup").build();
     auto_connect.set_value(server.auto_connect);
     sizer.add(&auto_connect, 0, SizerFlag::All, 6);
@@ -114,6 +128,8 @@ pub fn edit_server(parent: &dyn WxWidget, title: &str, server: &ServerConfig, ot
             auto_connect: auto_connect.get_value(),
             connect_commands: parse_commands(&commands.get_value()),
             fingerprint: fingerprint_value.borrow().clone(),
+            sasl_username: sasl_username.get_value().trim().to_string(),
+            sasl_password: sasl_password.get_value(),
         });
         dialog.end_modal(ID_OK);
     });

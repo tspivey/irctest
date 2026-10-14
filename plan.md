@@ -14,7 +14,7 @@ An accessible IRC client for Windows, built with wxDragon (GUI) and prismer (scr
 - Incoming text is appended to the end of the output box **without moving the cursor**.
 - Speech through prismer: on by default for each new channel. F5 toggles speech for the current tab, Shift+F5 toggles speech everywhere.
   Spoken format: `"<nick> on <channel without #> says <text>"`.
-- SASL comes later.
+- SASL PLAIN login (step 12).
 
 ## Architecture
 
@@ -85,6 +85,8 @@ connect_commands = [
   "JOIN #test",
 ]
 fingerprint = ""        # trusted TLS certificate (SHA-256, colon hex); blank = none
+sasl_username = ""      # blank = the nickname
+sasl_password = ""      # blank = no SASL
 ```
 
 Saved whenever the server or settings dialogs are closed with OK. Missing file = empty default config (no error).
@@ -316,8 +318,19 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - **Tested against 10.0.0.2:6697 (Ergo, self-signed)**: headless trusts once and registers (`+Z`); our fingerprint matches `openssl s_client`. In the app (via UI Automation and keys): the dialog on auto-connect, Trust always saved the fingerprint and connected, a restart connected without asking, Delete fingerprint in the editor (field shows None, focus moves to it, button disabled) saved a blank one, Reconnect then Disconnect gave "Disconnected: The server's certificate wasn't trusted." with no reconnect, Trust once connected without saving and a further Reconnect didn't ask, and a wrong saved fingerprint showed the "has changed" dialog.
 - Known gap: choosing Trust always while the server manager is open gets overwritten by the manager's own copy of the server list when it next saves.
 
+### Step 12 — SASL PLAIN
+- Per-server `sasl_username` (blank = the nickname) and `sasl_password` (blank = no SASL). Old config files need nothing: missing fields are blank.
+- With a password: `CAP LS 302` before PASS/NICK/USER, `CAP REQ :sasl` if the (possibly multi-line) list offers `sasl` with PLAIN or no mechanism list, then `AUTHENTICATE PLAIN`, the credentials on `AUTHENTICATE +`, and `CAP END` on 903/907.
+- If the server doesn't offer SASL or PLAIN, NAKs it, or login fails (902/904/905/906), say so on the server tab and carry on registering without logging in.
+
+**Done.**
+- `net.rs`: `Sasl` state on `Connection` (`Idle`, `Listing`, `Requested`, `Authenticating`); `handle_cap`, `send_credentials` (base64 of `\0user\0pass`, no authorization identity, 400-byte pieces with a trailing `+` after an exact multiple), `end_sasl`. A 001 before we finish (a server without CAP) just ends SASL. New dependency `base64`.
+- `format.rs`: AUTHENTICATE lines are hidden; 900/901 show only their text ("You are now logged in as ...").
+- Edit server dialog: "SASL username" and "SASL password" fields after the nickname.
+- Tests: login with a multi-line CAP LS, no mechanism list, not offered, no PLAIN, NAK, 904 carries on, long credentials split at 400, 001 ends SASL; the username fallback; the 900 format.
+- **Tested against a real server:** login works.
+
 ### Later
-- SASL PLAIN: `CAP LS` / `CAP REQ :sasl` / `AUTHENTICATE` / `CAP END` in `Connection::register` and `handle_line`.
 - Nick list, tab completion of nicks.
 - Request `server-time` and suppress speech for ZNC playback buffer.
 
