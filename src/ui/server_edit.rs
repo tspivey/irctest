@@ -23,15 +23,14 @@ pub fn edit_server(parent: &dyn WxWidget, title: &str, server: &ServerConfig, ot
     tls.set_value(server.tls);
     sizer.add(&tls, 0, SizerFlag::All, 6);
     let fingerprint_value = Rc::new(RefCell::new(server.fingerprint.clone()));
-    // A group box rather than a label: NVDA reads a dialog's read-only single-line edits as its
-    // description (Dialog.getDialogText), except one straight after a grouping. The box and the
-    // controls are siblings, created in this order, so the field directly follows the box.
+    // Multiline because NVDA reads a dialog's read-only single-line edits as its description
+    // (Dialog.getDialogText). wxStaticBoxSizer requires its controls to be children of the box.
     let fingerprint_box = StaticBox::builder(&dialog).with_label("Trusted certificate &fingerprint").build();
-    let fingerprint = TextCtrl::builder(&dialog).with_style(TextCtrlStyle::ReadOnly).build();
-    // wx leaves read-only single-line text out of Tab navigation unless asked.
-    fingerprint.enable_focus_from_keyboard();
+    let fingerprint = TextCtrl::builder(&fingerprint_box)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::NoVScroll)
+        .build();
     fingerprint.set_value(&fingerprint_text(&server.fingerprint));
-    let delete_fingerprint = Button::builder(&dialog).with_label("&Delete fingerprint").build();
+    let delete_fingerprint = Button::builder(&fingerprint_box).with_label("&Delete fingerprint").build();
     delete_fingerprint.enable(!server.fingerprint.is_empty());
     let fingerprint_sizer = StaticBoxSizerBuilder::new_with_box(&fingerprint_box, Orientation::Vertical).build();
     fingerprint_sizer.add(&fingerprint, 0, SizerFlag::Expand | SizerFlag::All, 6);
