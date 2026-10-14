@@ -87,6 +87,15 @@ pub fn format_message(msg: &Message) -> Option<Formatted> {
             Formatted::line(format!("Users on {}: {}", args[2], args[3]))
         }
         Command::Response(Response::RPL_ENDOFNAMES, _) => return None,
+        // `<nick> <channel> <users> :<topic>`
+        Command::Response(Response::RPL_LIST, args) if args.len() >= 3 => {
+            let users = if args[2] == "1" { "1 user".to_string() } else { format!("{} users", args[2]) };
+            let topic = args.get(3).map(|t| t.trim()).filter(|t| !t.is_empty());
+            Formatted::line(match topic {
+                Some(topic) => format!("{} ({users}): {topic}", args[1]),
+                None => format!("{} ({users})", args[1]),
+            })
+        }
         Command::Response(Response::RPL_NOTOPIC, args) if args.len() >= 2 => {
             Formatted::line(format!("No topic is set for {}", args[1]))
         }
@@ -362,6 +371,13 @@ mod tests {
         assert!(text(":srv 333 tyler #test bob 1760356800\r\n").starts_with("Topic for #test set by bob on 20"));
         assert_eq!(text(":srv 353 tyler = #test :tyler @bob\r\n"), "Users on #test: tyler @bob");
         assert_eq!(fmt(":srv 366 tyler #test :End of NAMES list\r\n"), None);
+    }
+
+    #[test]
+    fn list_numerics() {
+        assert_eq!(text(":srv 322 tyler #test 1 :\r\n"), "#test (1 user)");
+        assert_eq!(text(":srv 322 tyler #rust 12 :[+nt] Rust talk\r\n"), "#rust (12 users): [+nt] Rust talk");
+        assert_eq!(text(":srv 323 tyler :End of LIST\r\n"), "End of LIST");
     }
 
     #[test]

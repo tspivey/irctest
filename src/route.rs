@@ -58,6 +58,35 @@ pub fn route(msg: &Message, me: &str) -> Route {
             Some(channel) => Route::TabIfOpen(channel.clone()),
             None => Route::Server,
         },
+        // /LIST output is about many channels; keep it together in the server tab.
+        Command::Response(Response::RPL_LIST, _) => Route::Server,
+        // WHO and WHOIS/WHOWAS output stays together in the server tab: a WHO line names whichever
+        // channel the user happens to be in, and the closing numeric names the mask.
+        Command::Response(
+            Response::RPL_WHOREPLY
+            | Response::RPL_ENDOFWHO
+            | Response::RPL_WHOISUSER
+            | Response::RPL_WHOISSERVER
+            | Response::RPL_WHOISOPERATOR
+            | Response::RPL_WHOISIDLE
+            | Response::RPL_WHOISCHANNELS
+            | Response::RPL_WHOISCERTFP
+            | Response::RPL_WHOISKEYVALUE
+            | Response::RPL_ENDOFWHOIS
+            | Response::RPL_WHOWASUSER
+            | Response::RPL_ENDOFWHOWAS,
+            _,
+        ) => Route::Server,
+        // These name the nick we tried, not someone we're talking to.
+        Command::Response(Response::ERR_NICKNAMEINUSE | Response::ERR_ERRONEOUSNICKNAME, _) => Route::Server,
+        // `<me> <nick> <channel> ...`: about the channel, not the nick.
+        Command::Response(
+            Response::RPL_INVITING | Response::ERR_USERNOTINCHANNEL | Response::ERR_USERONCHANNEL,
+            args,
+        ) => match args.get(2) {
+            Some(channel) if channel.is_channel_name() => Route::TabIfOpen(channel.clone()),
+            _ => Route::Server,
+        },
         // Numerics about a channel or nick (topic, no such nick, ...) go to its tab if open.
         Command::Response(_, args) => match args.get(1) {
             Some(name) if args.len() > 2 => Route::TabIfOpen(name.clone()),
@@ -131,6 +160,19 @@ mod tests {
         assert_eq!(r(":srv 353 tyler = #test :tyler bob\r\n"), Route::TabIfOpen("#test".into()));
         assert_eq!(r(":srv 401 tyler bob :No such nick\r\n"), Route::TabIfOpen("bob".into()));
         assert_eq!(r(":srv 999 tyler some :thing\r\n"), Route::Server);
+        assert_eq!(r(":srv 322 tyler #test 1 :the topic\r\n"), Route::Server);
+        assert_eq!(r(":srv 352 tyler #test b host srv bob H :0 Bob\r\n"), Route::Server);
+        assert_eq!(r(":srv 315 tyler bob :End of WHO list\r\n"), Route::Server);
+        assert_eq!(r(":srv 311 tyler bob b host * :Bob\r\n"), Route::Server);
+        assert_eq!(r(":srv 319 tyler bob :#test #rust\r\n"), Route::Server);
+        assert_eq!(r(":srv 318 tyler bob :End of WHOIS list\r\n"), Route::Server);
+        assert_eq!(r(":srv 433 tyler bob :Nickname is already in use\r\n"), Route::Server);
+        assert_eq!(r(":srv 432 tyler b@d :Erroneous nickname\r\n"), Route::Server);
+        assert_eq!(r(":srv 341 tyler bob #test\r\n"), Route::TabIfOpen("#test".into()));
+        assert_eq!(r(":srv 441 tyler bob #test :They aren't on that channel\r\n"), Route::TabIfOpen("#test".into()));
+        assert_eq!(r(":srv 443 tyler bob #test :is already on channel\r\n"), Route::TabIfOpen("#test".into()));
+        // Still goes to the nick's tab.
+        assert_eq!(r(":srv 301 tyler bob :away\r\n"), Route::TabIfOpen("bob".into()));
     }
 
     #[test]
