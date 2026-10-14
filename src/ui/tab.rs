@@ -1,5 +1,7 @@
 use wxdragon::prelude::*;
 
+use super::richedit::disable_beep;
+
 /// One notebook page: a read-only output box above a single-line input box.
 pub struct Tab {
     pub panel: Panel,
@@ -21,6 +23,7 @@ impl Tab {
         let output = TextCtrl::builder(&panel)
             .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
             .build();
+        disable_beep(&output);
 
         let sizer = BoxSizer::builder(Orientation::Vertical).build();
         sizer.add(&output_label, 0, SizerFlag::Left | SizerFlag::Top | SizerFlag::Right, 4);

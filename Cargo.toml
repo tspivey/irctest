@@ -19,3 +19,6 @@ wxdragon-sys = { git = "https://github.com/AllenDang/wxDragon" }
 
 [build-dependencies]
 embed-manifest = "1.4"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_UI_Controls_RichEdit", "Win32_UI_WindowsAndMessaging"] }

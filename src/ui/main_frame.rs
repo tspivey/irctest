@@ -7,6 +7,7 @@ use irctest::net::{EventSink, NetEvent, ServerId};
 use tokio::runtime::Handle;
 use wxdragon::prelude::*;
 
+use super::richedit::disable_beep;
 use super::server_dialog::manage_servers;
 use super::settings_dialog::{Settings, edit_settings};
 use super::state::State;
@@ -184,6 +185,7 @@ fn add_placeholder_page(notebook: &Notebook, config: &Config) -> Panel {
     let output = TextCtrl::builder(&panel)
         .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
         .build();
+    disable_beep(&output);
     let servers = match config.servers.len() {
         1 => "1 server".to_string(),
         n => format!("{n} servers"),
