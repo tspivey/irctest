@@ -3,7 +3,8 @@
 //!     cargo run --example headless [server name]
 //!
 //! Prints formatted incoming messages (and speech text), and sends each stdin line raw.
-//! End of input sends QUIT and waits for the disconnect.
+//! End of input sends QUIT and waits for the disconnect. An untrusted TLS certificate is
+//! printed and trusted for this run.
 
 use std::io::BufRead;
 use std::sync::mpsc;
@@ -43,6 +44,11 @@ fn main() {
         },
         NetEvent::NickChanged(nick) => println!("[{id}] our nick is now {nick}"),
         NetEvent::Error(e) => println!("[{id}] error: {e}"),
+        NetEvent::UntrustedCertificate(prompt) => {
+            let what = if prompt.changed { "changed" } else { "untrusted" };
+            println!("[{id}] {what} certificate ({}), trusting once: {}", prompt.reason, prompt.fingerprint);
+            prompt.answer(true);
+        }
         NetEvent::Disconnected { reason, .. } => {
             println!("[{id}] disconnected: {reason}");
             let _ = done_tx.lock().unwrap().send(());
@@ -50,7 +56,7 @@ fn main() {
     });
 
     println!("Connecting to {}:{} as {}", server.host, server.port, config.effective_nick(&server));
-    net::connect(runtime.handle(), 1, &config, &server, sink);
+    net::connect(runtime.handle(), 1, &config, &server, &[], sink);
 
     // Disconnects can happen while we're blocked on stdin; check for one after each line.
     for line in std::io::stdin().lock().lines() {

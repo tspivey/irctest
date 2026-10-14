@@ -48,6 +48,9 @@ pub struct ServerConfig {
     pub auto_connect: bool,
     /// Raw IRC lines sent after registration (001).
     pub connect_commands: Vec<String>,
+    /// SHA-256 fingerprint of a TLS certificate to accept even though Windows doesn't trust it
+    /// (e.g. self-signed), as colon-separated hex. Blank = none.
+    pub fingerprint: String,
 }
 
 impl Default for ServerConfig {
@@ -61,6 +64,7 @@ impl Default for ServerConfig {
             nickname: String::new(),
             auto_connect: false,
             connect_commands: Vec::new(),
+            fingerprint: String::new(),
         }
     }
 }
@@ -168,6 +172,7 @@ mod tests {
                 nickname: String::new(),
                 auto_connect: true,
                 connect_commands: vec!["JOIN #test".into(), "PRIVMSG NickServ :IDENTIFY x".into()],
+                fingerprint: "AB:CD".into(),
             }],
         }
     }
@@ -203,6 +208,7 @@ mod tests {
         assert!(!server.tls);
         assert!(!server.auto_connect);
         assert!(server.connect_commands.is_empty());
+        assert_eq!(server.fingerprint, "");
         assert_eq!(config.username, "");
         assert!(config.log);
     }

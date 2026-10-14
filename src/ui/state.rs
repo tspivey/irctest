@@ -11,13 +11,14 @@ use irctest::config::{Config, ServerConfig};
 use irctest::format::{format_message, message_time, parse_ctcp, spoken_channel, strip_formatting, timestamped};
 use irctest::history::History;
 use irctest::log::{Logger, SERVER_TARGET};
-use irctest::net::{self, EventSink, NetEvent, Sender, ServerId};
+use irctest::net::{self, CertificatePrompt, EventSink, NetEvent, Sender, ServerId};
 use irctest::route::{Route, irc_eq, irc_lower, route};
 use irctest::speech::{Speech, mentions, should_speak};
 use tokio::runtime::Handle;
 use tokio::task::AbortHandle;
 use wxdragon::prelude::*;
 
+use super::cert_dialog::CertificateChoice;
 use super::tab::{Tab, set_page_text};
 
 pub type TabId = u64;
@@ -63,6 +64,9 @@ pub struct Server {
     attempts: u32,
     /// One-shot timer for the next automatic reconnect; running while one is pending.
     reconnect_timer: Timer<Notebook>,
+    /// Certificate fingerprints the user chose to trust once: kept for reconnects until
+    /// irctest exits, but not saved.
+    accepted_fingerprints: Vec<String>,
 }
 
 pub struct State {
@@ -157,7 +161,14 @@ impl State {
         }
         let nick = self.config.effective_nick(&server.config).to_string();
         let text = format!("Connecting to {}:{} as {nick}...", server.config.host, server.config.port);
-        server.task = Some(net::connect(&self.runtime, server.id, &self.config, &server.config, self.sink.clone()));
+        server.task = Some(net::connect(
+            &self.runtime,
+            server.id,
+            &self.config,
+            &server.config,
+            &server.accepted_fingerprints,
+            self.sink.clone(),
+        ));
         self.line(s, 0, &text);
     }
 
@@ -263,6 +274,7 @@ impl State {
             user_quit: false,
             attempts: 0,
             reconnect_timer,
+            accepted_fingerprints: Vec::new(),
         });
         let s = self.servers.len() - 1;
         let t = self.insert_tab(s, TabKind::Server, &label, true);
@@ -516,6 +528,8 @@ impl State {
             NetEvent::Message(msg) => self.handle_message(s, &msg),
             NetEvent::NickChanged(nick) => self.servers[s].nick = nick,
             NetEvent::Error(e) => self.line(s, 0, &format!("Error: {e}")),
+            // Needs a dialog, which the caller shows: see `certificate_prompt`.
+            NetEvent::UntrustedCertificate(prompt) => prompt.answer(false),
             NetEvent::Disconnected { reason, retry } => {
                 self.mark_disconnected(s, &format!("Disconnected: {reason}"));
                 if retry && !self.servers[s].user_quit {
@@ -523,6 +537,46 @@ impl State {
                 }
             }
         }
+    }
+
+    /// A server's certificate isn't trusted: says so in its server tab. Returns the server's
+    /// name and saved fingerprint for the dialog, or `None` if the server is gone.
+    /// Call `certificate_answered` with the user's choice.
+    pub fn certificate_prompt(&mut self, id: ServerId, prompt: &CertificatePrompt) -> Option<(String, String)> {
+        let s = self.servers.iter().position(|server| server.id == id)?;
+        let what = if prompt.changed { "has changed" } else { "isn't trusted" };
+        self.line(s, 0, &format!("The server's certificate {what}: {}", prompt.reason));
+        self.line(s, 0, &format!("SHA-256 fingerprint: {}", prompt.fingerprint));
+        let config = &self.servers[s].config;
+        Some((config.name.clone(), config.fingerprint.clone()))
+    }
+
+    pub fn certificate_answered(&mut self, id: ServerId, prompt: CertificatePrompt, choice: CertificateChoice) {
+        let Some(s) = self.servers.iter().position(|server| server.id == id) else {
+            return prompt.answer(false);
+        };
+        match choice {
+            CertificateChoice::TrustOnce => {
+                self.servers[s].accepted_fingerprints.push(prompt.fingerprint.clone());
+                self.line(s, 0, "Trusting this certificate until irctest exits.");
+            }
+            CertificateChoice::TrustAlways => {
+                // Trusted now even if saving fails.
+                self.servers[s].accepted_fingerprints.push(prompt.fingerprint.clone());
+                self.servers[s].config.fingerprint = prompt.fingerprint.clone();
+                let name = self.servers[s].config.name.clone();
+                if let Some(config) = self.config.servers.iter_mut().find(|c| irc_eq(&c.name, &name)) {
+                    config.fingerprint = prompt.fingerprint.clone();
+                }
+                match self.config.save() {
+                    Ok(()) => self.line(s, 0, "Certificate fingerprint saved."),
+                    Err(e) => self.line(s, 0, &format!("Couldn't save the certificate fingerprint: {e}")),
+                }
+            }
+            // The Disconnected event that follows says why.
+            CertificateChoice::Disconnect => {}
+        }
+        prompt.answer(choice != CertificateChoice::Disconnect);
     }
 
     /// The connection is gone: forget it, mark channels parted, and say so in every tab.

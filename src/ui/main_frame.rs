@@ -7,6 +7,7 @@ use irctest::net::{EventSink, NetEvent, ServerId};
 use tokio::runtime::Handle;
 use wxdragon::prelude::*;
 
+use super::cert_dialog::ask_certificate;
 use super::richedit::disable_beep;
 use super::server_dialog::manage_servers;
 use super::settings_dialog::{Settings, edit_settings};
@@ -68,7 +69,19 @@ impl MainFrame {
         NET_HANDLER.with(|handler| {
             *handler.borrow_mut() = Some(Box::new(move || {
                 while let Ok((id, event)) = rx.try_recv() {
-                    drain_state.borrow_mut().handle_net_event(id, event);
+                    match event {
+                        // State isn't borrowed while the dialog runs. Other events wait in the
+                        // queue until it closes: this drain is still running.
+                        NetEvent::UntrustedCertificate(prompt) => {
+                            let Some((name, saved)) = drain_state.borrow_mut().certificate_prompt(id, &prompt) else {
+                                prompt.answer(false);
+                                continue;
+                            };
+                            let choice = ask_certificate(&frame, &name, &saved, &prompt);
+                            drain_state.borrow_mut().certificate_answered(id, prompt, choice);
+                        }
+                        event => drain_state.borrow_mut().handle_net_event(id, event),
+                    }
                 }
             }));
         });

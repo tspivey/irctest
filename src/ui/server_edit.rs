@@ -22,6 +22,42 @@ pub fn edit_server(parent: &dyn WxWidget, title: &str, server: &ServerConfig, ot
     let tls = CheckBox::builder(&dialog).with_label("Use &TLS").build();
     tls.set_value(server.tls);
     sizer.add(&tls, 0, SizerFlag::All, 6);
+    let fingerprint_value = Rc::new(RefCell::new(server.fingerprint.clone()));
+    // A group box rather than a label: NVDA reads a dialog's read-only single-line edits as its
+    // description (Dialog.getDialogText), except one straight after a grouping. The box and the
+    // controls are siblings, created in this order, so the field directly follows the box.
+    let fingerprint_box = StaticBox::builder(&dialog).with_label("Trusted certificate &fingerprint").build();
+    let fingerprint = TextCtrl::builder(&dialog).with_style(TextCtrlStyle::ReadOnly).build();
+    // wx leaves read-only single-line text out of Tab navigation unless asked.
+    fingerprint.enable_focus_from_keyboard();
+    fingerprint.set_value(&fingerprint_text(&server.fingerprint));
+    let delete_fingerprint = Button::builder(&dialog).with_label("&Delete fingerprint").build();
+    delete_fingerprint.enable(!server.fingerprint.is_empty());
+    let fingerprint_sizer = StaticBoxSizerBuilder::new_with_box(&fingerprint_box, Orientation::Vertical).build();
+    fingerprint_sizer.add(&fingerprint, 0, SizerFlag::Expand | SizerFlag::All, 6);
+    fingerprint_sizer.add(&delete_fingerprint, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Bottom, 6);
+    sizer.add_sizer(&fingerprint_sizer, 0, SizerFlag::Expand | SizerFlag::All, 6);
+    // Neither wx nor Windows acts on a group box's mnemonic, so Alt+F is handled here.
+    dialog.on_char_hook(move |event| {
+        if let WindowEventData::Keyboard(key) = &event {
+            if key.alt_down() && !key.control_down() && !key.shift_down() && key.get_key_code() == Some('F' as i32) {
+                fingerprint.set_focus();
+                event.skip(false);
+                return;
+            }
+        }
+        event.skip(true);
+    });
+    {
+        let fingerprint_value = fingerprint_value.clone();
+        delete_fingerprint.on_click(move |_| {
+            fingerprint_value.borrow_mut().clear();
+            fingerprint.set_value(&fingerprint_text(""));
+            // The button is about to be disabled; don't leave focus on it.
+            fingerprint.set_focus();
+            delete_fingerprint.enable(false);
+        });
+    }
     let password = labeled_text(&dialog, &sizer, "Server pass&word", &server.password, TextCtrlStyle::Password);
     let nickname = labeled_text(
         &dialog,
@@ -77,6 +113,7 @@ pub fn edit_server(parent: &dyn WxWidget, title: &str, server: &ServerConfig, ot
             nickname: nickname.get_value().trim().to_string(),
             auto_connect: auto_connect.get_value(),
             connect_commands: parse_commands(&commands.get_value()),
+            fingerprint: fingerprint_value.borrow().clone(),
         });
         dialog.end_modal(ID_OK);
     });
@@ -105,6 +142,11 @@ fn complain(dialog: &Dialog, text: &str, field: &TextCtrl) {
         .build()
         .show_modal();
     field.set_focus();
+}
+
+/// What the fingerprint box shows.
+fn fingerprint_text(fingerprint: &str) -> String {
+    if fingerprint.is_empty() { "None".into() } else { fingerprint.into() }
 }
 
 fn parse_port(text: &str) -> Option<u16> {

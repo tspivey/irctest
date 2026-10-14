@@ -46,6 +46,7 @@ src/
 
 ### What `net.rs` does
 
+- TLS: a normal handshake first. If it fails, a second connection with verification off; its certificate's SHA-256 fingerprint is checked against the saved and accepted ones, and otherwise the user is asked (`NetEvent::UntrustedCertificate`) before registering on that same connection (step 11).
 - Registration: `PASS` (when the password isn't empty), `NICK`, `USER`.
 - Nick in use or invalid (`433`/`432`) before `001`: tries `nick_`, `nick__`, `nick___` in turn, then gives up with "Every nickname is in use." (no retry). After registration the user picks their own nick.
 - Tracks our nick: from `001`'s first parameter and from `NICK` messages whose source is us. `NickChanged` is sent after the message that caused it, so the GUI routes that message with the old nick.
@@ -83,6 +84,7 @@ auto_connect = true
 connect_commands = [
   "JOIN #test",
 ]
+fingerprint = ""        # trusted TLS certificate (SHA-256, colon hex); blank = none
 ```
 
 Saved whenever the server or settings dialogs are closed with OK. Missing file = empty default config (no error).
@@ -296,6 +298,23 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - Behaviour changes: no `CAP END` before registration; `/quit` with no reason sends a bare `QUIT` (the client sent "Powered by Rust."); no `FINGER`/`SOURCE`/`USERINFO` replies; CTCP replies go to the sender, not the channel; alt nicks only before `001`.
 - Unit tests run sessions over `tokio::io::duplex`: registration, PING/PONG, alt nicks and giving up, `001` nick and connect commands, our own and others' NICK, CTCP, bad and overlong lines, invalid UTF-8, server close, and the ping timeout (paused clock).
 - **Tested against 10.0.0.2 (Ergo 2.20)** with `examples/headless.rs` and a second raw client holding `tyler`: alt nick `tyler_`, `JOIN #test` after 001, CTCP VERSION and PING answered, FINGER ignored, `NICK tylerx` gave `our nick is now tylerx`, a message from the new nick arrived, QUIT closed cleanly. Port 6697 fails with "TLS handshake failed: ... root certificate which is not trusted" (Ergo's self-signed certificate; next step).
+
+### Step 11 — Self-signed certificates
+- When Windows rejects a server's certificate, show its SHA-256 fingerprint and ask: Trust once, Trust always, or Disconnect.
+  - Trust once: carry on, and accept that fingerprint for this server until irctest exits (so automatic reconnects don't ask again). Not saved.
+  - Trust always: carry on, and save the fingerprint in the server's `fingerprint`.
+  - Disconnect: drop the connection, no automatic reconnect.
+- A saved fingerprint that no longer matches gets the same dialog, saying the certificate has changed and showing both fingerprints.
+- The edit server dialog shows the saved fingerprint (read-only, "None" if blank) and a Delete fingerprint button, enabled when there is one.
+  - They sit in a "Trusted certificate fingerprint" group box, with the field directly after the box, rather than under a plain label. NVDA reads every read-only single-line edit in a dialog as the dialog's description (`Dialog.getDialogText` in `NVDAObjects/behaviors.py`) unless it comes straight after a grouping, so with a label the fingerprint was read whenever the dialog opened. The field takes its accessible name from the box. Windows and wx ignore a group box's mnemonic, so the dialog's char hook handles Alt+F. wx also leaves read-only single-line text out of Tab navigation (`wxTextCtrl::AcceptsFocusFromKeyboard`), so the field calls `enable_focus_from_keyboard()`.
+
+**Done.**
+- `net.rs`: `check_certificate` connects a second time without verification (the first handshake's error doesn't carry the certificate) and uses that connection, so the certificate checked is the one on the connection we register on. Any failure on the second try reports the first handshake's error. `fingerprint()` is upper-case colon hex like `openssl x509 -fingerprint -sha256`; `same_fingerprint` ignores case, colons and spaces. `CertificatePrompt::answer(bool)`; dropping it unanswered refuses.
+- The prompt comes to the GUI as `NetEvent::UntrustedCertificate`. The drain loop in `main_frame.rs` handles it: `State::certificate_prompt` writes the reason and fingerprint to the server tab, `ui/cert_dialog.rs` asks (State not borrowed), `State::certificate_answered` records the choice and saves the config for Trust always. Other network events wait until the dialog closes. Disconnect is the default button and Escape.
+- A read error after we sent QUIT or the server sent ERROR now reads "Connection closed." (Ergo resets TLS connections after QUIT, sometimes discarding the ERROR line).
+- Tests: fingerprint format and matching; against a local TLS server with `testdata/selfsigned.{crt,key}` (an RSA test certificate valid for 100 years; Windows can't import other PKCS#8 keys): prompt then carry on, refuse, saved and accepted fingerprints skip the prompt, changed certificate, non-TLS port reports the handshake error.
+- **Tested against 10.0.0.2:6697 (Ergo, self-signed)**: headless trusts once and registers (`+Z`); our fingerprint matches `openssl s_client`. In the app (via UI Automation and keys): the dialog on auto-connect, Trust always saved the fingerprint and connected, a restart connected without asking, Delete fingerprint in the editor (field shows None, focus moves to it, button disabled) saved a blank one, Reconnect then Disconnect gave "Disconnected: The server's certificate wasn't trusted." with no reconnect, Trust once connected without saving and a further Reconnect didn't ask, and a wrong saved fingerprint showed the "has changed" dialog.
+- Known gap: choosing Trust always while the server manager is open gets overwritten by the manager's own copy of the server list when it next saves.
 
 ### Later
 - SASL PLAIN: `CAP LS` / `CAP REQ :sasl` / `AUTHENTICATE` / `CAP END` in `Connection::register` and `handle_line`.

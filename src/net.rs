@@ -7,13 +7,15 @@
 use std::fmt;
 use std::future::pending;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use irc_proto::{Command, Message, Response};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, interval_at, sleep_until};
 
@@ -34,12 +36,36 @@ pub enum NetEvent {
     NickChanged(String),
     /// Something went wrong but the connection is still up (e.g. an unparseable line).
     Error(String),
+    /// The server's TLS certificate isn't trusted by Windows or by fingerprint. The connection
+    /// waits, without registering, until the prompt is answered.
+    UntrustedCertificate(CertificatePrompt),
     /// The connection is gone, or never came up. Always the last event.
-    /// `retry` is false when reconnecting wouldn't help (no nick set, every nick in use).
+    /// `retry` is false when reconnecting wouldn't help (no nick set, every nick in use,
+    /// certificate refused).
     Disconnected { reason: String, retry: bool },
 }
 
 pub type EventSink = Arc<dyn Fn(ServerId, NetEvent) + Send + Sync>;
+
+/// Asks whether to carry on with a certificate Windows doesn't trust.
+#[derive(Debug)]
+pub struct CertificatePrompt {
+    /// SHA-256 of the certificate, as colon-separated hex.
+    pub fingerprint: String,
+    /// Why Windows rejected it.
+    pub reason: String,
+    /// A different fingerprint is saved for this server: the certificate has changed.
+    pub changed: bool,
+    reply: oneshot::Sender<bool>,
+}
+
+impl CertificatePrompt {
+    /// True carries on with this connection; false drops it without reconnecting.
+    /// Dropping the prompt unanswered is the same as false.
+    pub fn answer(self, trust: bool) {
+        let _ = self.reply.send(trust);
+    }
+}
 
 /// Queues messages for a connection. Cheap to clone; sending never blocks.
 #[derive(Debug, Clone)]
@@ -98,11 +124,16 @@ pub struct Registration {
     pub realname: String,
     /// Raw lines sent after 001.
     pub connect_commands: Vec<String>,
+    /// The fingerprint saved for this server; blank if none.
+    pub pinned: String,
+    /// Fingerprints the user accepted for this run of the program only.
+    pub accepted: Vec<String>,
 }
 
 impl Registration {
+    /// `accepted` are certificate fingerprints trusted for now, on top of the saved one.
     /// Errors are user-facing messages.
-    pub fn new(config: &Config, server: &ServerConfig) -> Result<Self, String> {
+    pub fn new(config: &Config, server: &ServerConfig, accepted: &[String]) -> Result<Self, String> {
         let nick = config.effective_nick(server);
         if nick.is_empty() {
             return Err("No nickname set. Set a global nickname or one for this server.".into());
@@ -120,14 +151,28 @@ impl Registration {
             username: config.effective_username(server).to_string(),
             realname: config.effective_realname(server).to_string(),
             connect_commands: server.connect_commands.clone(),
+            pinned: server.fingerprint.trim().to_string(),
+            accepted: accepted.to_vec(),
         })
+    }
+
+    fn trusts(&self, fingerprint: &str) -> bool {
+        std::iter::once(&self.pinned).chain(&self.accepted).any(|f| same_fingerprint(f, fingerprint))
     }
 }
 
 /// Starts connecting in the background. Abort the returned handle to drop the connection
 /// without a QUIT (e.g. while a connect is hanging); otherwise send QUIT through the sender.
-pub fn connect(handle: &Handle, id: ServerId, config: &Config, server: &ServerConfig, sink: EventSink) -> AbortHandle {
-    let registration = Registration::new(config, server);
+/// `accepted` are certificate fingerprints trusted for now, on top of the saved one.
+pub fn connect(
+    handle: &Handle,
+    id: ServerId,
+    config: &Config,
+    server: &ServerConfig,
+    accepted: &[String],
+    sink: EventSink,
+) -> AbortHandle {
+    let registration = Registration::new(config, server, accepted);
     handle
         .spawn(async move {
             let (reason, retry) = match registration {
@@ -141,21 +186,77 @@ pub fn connect(handle: &Handle, id: ServerId, config: &Config, server: &ServerCo
 
 /// Runs one connection until it ends; returns the reason and whether a reconnect makes sense.
 async fn run(id: ServerId, reg: Registration, sink: EventSink) -> (String, bool) {
-    let tcp = match TcpStream::connect((reg.host.as_str(), reg.port)).await {
+    let tcp = match tcp_connect(&reg).await {
         Ok(tcp) => tcp,
-        Err(e) => return (format!("Couldn't connect: {}", describe(&e)), true),
+        Err(end) => return end,
     };
     if !reg.tls {
         return session(id, reg, tcp, sink).await;
     }
-    let connector = match native_tls::TlsConnector::new() {
-        Ok(c) => tokio_native_tls::TlsConnector::from(c),
-        Err(e) => return (format!("Couldn't set up TLS: {}", describe(&e)), false),
+    let tls = match tls_connect(&reg.host, tcp, true).await {
+        Ok(tls) => tls,
+        Err(e) => match check_certificate(id, &reg, &sink, describe(&e)).await {
+            Ok(tls) => tls,
+            Err(end) => return end,
+        },
     };
-    match connector.connect(&reg.host, tcp).await {
-        Ok(tls) => session(id, reg, tls, sink).await,
-        Err(e) => (format!("TLS handshake failed: {}", describe(&e)), true),
+    session(id, reg, tls, sink).await
+}
+
+async fn tcp_connect(reg: &Registration) -> Result<TcpStream, (String, bool)> {
+    TcpStream::connect((reg.host.as_str(), reg.port)).await.map_err(|e| (format!("Couldn't connect: {}", describe(&e)), true))
+}
+
+type TlsStream = tokio_native_tls::TlsStream<TcpStream>;
+
+/// A TLS handshake; with `verify` false any certificate is accepted.
+async fn tls_connect(host: &str, tcp: TcpStream, verify: bool) -> Result<TlsStream, native_tls::Error> {
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(!verify)
+        .danger_accept_invalid_hostnames(!verify)
+        .build()?;
+    tokio_native_tls::TlsConnector::from(connector).connect(host, tcp).await
+}
+
+/// The handshake failed with `reason`, perhaps over the certificate. Connects again without
+/// checking it, and uses that connection if its certificate's fingerprint is trusted or the
+/// user says to go ahead. Checking the connection we then use (not an earlier one) means a
+/// server can't show one certificate to the check and another to the session.
+async fn check_certificate(id: ServerId, reg: &Registration, sink: &EventSink, reason: String) -> Result<TlsStream, (String, bool)> {
+    let failed = || (format!("TLS handshake failed: {reason}"), true);
+    // Any failure here means the problem wasn't (only) the certificate: report the first error.
+    let tcp = tcp_connect(reg).await?;
+    let tls = tls_connect(&reg.host, tcp, false).await.map_err(|_| failed())?;
+    let der = match tls.get_ref().peer_certificate() {
+        Ok(Some(cert)) => cert.to_der().map_err(|_| failed())?,
+        _ => return Err(failed()),
+    };
+    let fingerprint = fingerprint(&der);
+    if reg.trusts(&fingerprint) {
+        return Ok(tls);
     }
+    let (reply, answer) = oneshot::channel();
+    let changed = !reg.pinned.is_empty();
+    sink(id, NetEvent::UntrustedCertificate(CertificatePrompt { fingerprint, reason, changed, reply }));
+    match answer.await {
+        Ok(true) => Ok(tls),
+        _ => Err(("The server's certificate wasn't trusted.".into(), false)),
+    }
+}
+
+/// SHA-256 of a DER certificate as colon-separated upper-case hex, the way most clients
+/// and servers show it.
+pub fn fingerprint(der: &[u8]) -> String {
+    let hex: Vec<String> = Sha256::digest(der).iter().map(|b| format!("{b:02X}")).collect();
+    hex.join(":")
+}
+
+/// Compares fingerprints ignoring case, colons and spaces, so a hand-edited or pasted one
+/// still matches. A blank one matches nothing.
+pub fn same_fingerprint(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.chars().filter(char::is_ascii_hexdigit).map(|c| c.to_ascii_uppercase()).collect::<String>();
+    let a = norm(a);
+    !a.is_empty() && a == norm(b)
 }
 
 /// Registers and runs the connection over an open stream until it ends.
@@ -165,7 +266,8 @@ where
 {
     let (read, mut write) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut conn = Connection { id, sink, sender: Sender(tx), nick: reg.nick.clone(), alt_nick: 0, registered: false, reg };
+    let mut conn = Connection { id, sink, sender: Sender(tx), nick: reg.nick.clone(), alt_nick: 0, registered: false, closing: Arc::default(), reg };
+    let closing = conn.closing.clone();
     conn.register();
     conn.event(NetEvent::Connected(conn.sender.clone()));
     conn.event(NetEvent::NickChanged(conn.nick.clone()));
@@ -173,6 +275,9 @@ where
     // Only ends with an error: `conn` holds a sender, so `rx` stays open.
     let writer = async move {
         while let Some(msg) = rx.recv().await {
+            if matches!(msg.command, Command::QUIT(_)) {
+                closing.store(true, Ordering::Relaxed);
+            }
             write.write_all(wire(&msg).as_bytes()).await?;
             write.flush().await?;
         }
@@ -195,6 +300,8 @@ struct Connection {
     alt_nick: usize,
     /// Seen 001.
     registered: bool,
+    /// We sent QUIT or the server sent ERROR: the connection is about to close.
+    closing: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -236,6 +343,9 @@ impl Connection {
                         Ok(0) if line.is_empty() => return ("Connection closed.".into(), true),
                         // Cut short by the end of the stream or MAX_LINE: handle what we have.
                         Ok(_) => {}
+                        // Some servers reset the connection rather than closing it, and the
+                        // reset can even discard the ERROR line before it's read.
+                        Err(_) if self.closing.load(Ordering::Relaxed) => return ("Connection closed.".into(), true),
                         Err(e) => return (describe(&e), true),
                     }
                     deadline = None;
@@ -296,6 +406,7 @@ impl Connection {
                 self.set_nick(&alt);
             }
             Command::NICK(new) if source_is_me => self.set_nick(new),
+            Command::ERROR(_) => self.closing.store(true, Ordering::Relaxed),
             Command::PRIVMSG(_, body) if !source_is_me => {
                 if let (Some(from), Some((query, args))) = (msg.source_nickname(), parse_ctcp(body)) {
                     if let Some(reply) = ctcp_reply(query, args) {
@@ -378,7 +489,7 @@ mod tests {
     #[test]
     fn registration_uses_effective_names() {
         let config = Config { nickname: "tyler".into(), ..Config::default() };
-        let reg = Registration::new(&config, &server()).unwrap();
+        let reg = Registration::new(&config, &server(), &[]).unwrap();
         assert_eq!(reg.nick, "tyler");
         assert_eq!(reg.alt_nicks, vec!["tyler_", "tyler__", "tyler___"]);
         assert_eq!(reg.username, "tyler");
@@ -388,9 +499,9 @@ mod tests {
 
     #[test]
     fn registration_needs_nick_and_host() {
-        assert!(Registration::new(&Config::default(), &server()).is_err());
+        assert!(Registration::new(&Config::default(), &server(), &[]).is_err());
         let config = Config { nickname: "tyler".into(), ..Config::default() };
-        assert!(Registration::new(&config, &ServerConfig::default()).is_err());
+        assert!(Registration::new(&config, &ServerConfig::default(), &[]).is_err());
     }
 
     #[test]
@@ -425,6 +536,55 @@ mod tests {
         assert!(sender.send_quit("").is_err());
     }
 
+    fn test_reg() -> Registration {
+        Registration {
+            host: "test".into(),
+            port: 6667,
+            tls: false,
+            password: String::new(),
+            nick: "tyler".into(),
+            alt_nicks: vec!["tyler_".into(), "tyler__".into()],
+            username: "tspivey".into(),
+            realname: "Tyler S".into(),
+            connect_commands: Vec::new(),
+            pinned: String::new(),
+            accepted: Vec::new(),
+        }
+    }
+
+    /// A sink that queues events for the test to read.
+    fn channel_sink() -> (EventSink, mpsc::UnboundedReceiver<NetEvent>) {
+        let (tx, events) = mpsc::unbounded_channel();
+        let sink: EventSink = Arc::new(move |_, event| {
+            let _ = tx.send(event);
+        });
+        (sink, events)
+    }
+
+    #[test]
+    fn registration_trusts_saved_and_accepted_fingerprints() {
+        let config = Config { nickname: "tyler".into(), ..Config::default() };
+        let server = ServerConfig { fingerprint: " AB:CD ".into(), ..server() };
+        let reg = Registration::new(&config, &server, &["12:34".into()]).unwrap();
+        assert!(reg.trusts("ab:cd"));
+        assert!(reg.trusts("12:34"));
+        assert!(!reg.trusts("56:78"));
+        assert!(!Registration::new(&config, &self::server(), &[]).unwrap().trusts(""));
+    }
+
+    #[test]
+    fn fingerprints() {
+        // SHA-256 of "abc".
+        assert_eq!(
+            fingerprint(b"abc"),
+            "BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD"
+        );
+        assert!(same_fingerprint("ba:78:16", "BA7816"));
+        assert!(same_fingerprint("BA 78 16", "BA:78:16"));
+        assert!(!same_fingerprint("BA:78:16", "BA:78:17"));
+        assert!(!same_fingerprint("", ""));
+    }
+
     /// The server's end of a session running over an in-memory stream.
     struct Fake {
         lines: tokio::io::Lines<BufReader<ReadHalf<DuplexStream>>>,
@@ -436,21 +596,12 @@ mod tests {
     impl Fake {
         fn start(password: &str, connect_commands: &[&str]) -> Self {
             let reg = Registration {
-                host: "test".into(),
-                port: 6667,
-                tls: false,
                 password: password.into(),
-                nick: "tyler".into(),
-                alt_nicks: vec!["tyler_".into(), "tyler__".into()],
-                username: "tspivey".into(),
-                realname: "Tyler S".into(),
                 connect_commands: connect_commands.iter().map(|s| s.to_string()).collect(),
+                ..test_reg()
             };
             let (client, server) = tokio::io::duplex(64 * 1024);
-            let (tx, events) = mpsc::unbounded_channel();
-            let sink: EventSink = Arc::new(move |_, event| {
-                let _ = tx.send(event);
-            });
+            let (sink, events) = channel_sink();
             let session = tokio::spawn(session(1, reg, client, sink));
             let (read, write) = tokio::io::split(server);
             Self { lines: BufReader::new(read).lines(), write, events, session }
@@ -629,5 +780,127 @@ mod tests {
         assert_eq!(reason, "No reply from the server in 20 seconds.");
         assert!(retry);
         assert_eq!(start.elapsed(), PING_INTERVAL * 2 + PING_TIMEOUT);
+    }
+
+    /// A local TLS server with the self-signed certificate in `testdata` (RSA: Windows won't
+    /// import other PKCS#8 keys). Each accepted connection that completes the handshake sends
+    /// its first line (the client's first command) to `lines`.
+    struct TlsServer {
+        port: u16,
+        fingerprint: String,
+        lines: mpsc::UnboundedReceiver<String>,
+    }
+
+    impl TlsServer {
+        async fn start() -> Self {
+            let cert = include_bytes!("../testdata/selfsigned.crt");
+            let key = include_bytes!("../testdata/selfsigned.key");
+            let fingerprint = fingerprint(&native_tls::Certificate::from_pem(cert).unwrap().to_der().unwrap());
+            let identity = native_tls::Identity::from_pkcs8(cert, key).unwrap();
+            let acceptor = tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (tx, lines) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let (acceptor, tx) = (acceptor.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        // The verifying client hangs up mid-handshake.
+                        let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        let mut line = String::new();
+                        if BufReader::new(tls).read_line(&mut line).await.is_ok() {
+                            let _ = tx.send(line.trim_end().to_string());
+                        }
+                    });
+                }
+            });
+            Self { port, fingerprint, lines }
+        }
+
+        /// Runs a connection to this server; returns its events and the result.
+        fn connect(&self, pinned: &str, accepted: &[&str]) -> (mpsc::UnboundedReceiver<NetEvent>, JoinHandle<(String, bool)>) {
+            let reg = Registration {
+                host: "127.0.0.1".into(),
+                port: self.port,
+                tls: true,
+                pinned: pinned.into(),
+                accepted: accepted.iter().map(|s| s.to_string()).collect(),
+                ..test_reg()
+            };
+            let (sink, events) = channel_sink();
+            (events, tokio::spawn(run(1, reg, sink)))
+        }
+    }
+
+    async fn expect_prompt(events: &mut mpsc::UnboundedReceiver<NetEvent>) -> CertificatePrompt {
+        match events.recv().await {
+            Some(NetEvent::UntrustedCertificate(prompt)) => prompt,
+            other => panic!("expected a certificate prompt, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn untrusted_certificate_asks_then_carries_on() {
+        let mut server = TlsServer::start().await;
+        let (mut events, _run) = server.connect("", &[]);
+        let prompt = expect_prompt(&mut events).await;
+        // As `openssl x509 -noout -fingerprint -sha256` shows it.
+        assert_eq!(
+            prompt.fingerprint,
+            "F9:87:93:75:41:F5:FB:73:8E:85:06:EE:99:2B:D2:E8:A6:B3:22:78:73:61:A6:6C:53:9B:4A:E3:CC:5E:05:5D"
+        );
+        assert!(!prompt.changed);
+        assert!(!prompt.reason.is_empty());
+        prompt.answer(true);
+        assert!(matches!(events.recv().await, Some(NetEvent::Connected(_))));
+        assert_eq!(server.lines.recv().await.unwrap(), "NICK tyler");
+    }
+
+    #[tokio::test]
+    async fn refused_certificate_disconnects_for_good() {
+        let server = TlsServer::start().await;
+        let (mut events, run) = server.connect("", &[]);
+        expect_prompt(&mut events).await.answer(false);
+        assert_eq!(run.await.unwrap(), ("The server's certificate wasn't trusted.".into(), false));
+    }
+
+    #[tokio::test]
+    async fn trusted_fingerprints_skip_the_prompt() {
+        let mut server = TlsServer::start().await;
+        let fingerprint = server.fingerprint.to_lowercase();
+        for (pinned, accepted) in [(fingerprint.as_str(), vec![]), ("", vec![fingerprint.as_str()])] {
+            let (mut events, _run) = server.connect(pinned, &accepted);
+            assert!(matches!(events.recv().await, Some(NetEvent::Connected(_))));
+            assert_eq!(server.lines.recv().await.unwrap(), "NICK tyler");
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_certificate_says_so() {
+        let server = TlsServer::start().await;
+        let (mut events, _run) = server.connect("00:11:22", &[]);
+        let prompt = expect_prompt(&mut events).await;
+        assert!(prompt.changed);
+        assert_eq!(prompt.fingerprint, server.fingerprint);
+    }
+
+    #[tokio::test]
+    async fn non_tls_server_reports_the_handshake_error() {
+        // Accepts and closes, like a plain-text port would after garbage.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let _ = tcp.write_all(b"ERROR :not TLS\r\n").await;
+            }
+        });
+        let reg = Registration { host: "127.0.0.1".into(), port, tls: true, ..test_reg() };
+        let (sink, mut events) = channel_sink();
+        let (reason, retry) = run(1, reg, sink).await;
+        assert!(reason.starts_with("TLS handshake failed: "), "{reason}");
+        assert!(retry);
+        assert!(events.try_recv().is_err());
     }
 }

@@ -1,3 +1,4 @@
+pub mod cert_dialog;
 pub mod main_frame;
 pub mod richedit;
 pub mod server_dialog;
