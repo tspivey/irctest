@@ -22,8 +22,8 @@ An accessible IRC client for Windows, built with wxDragon (GUI) and prismer (scr
 src/
   main.rs          start-up: load config, build main frame, auto-connect
   config.rs        Config / ServerConfig, load + save irctest.toml (serde + toml)
-  net.rs           tokio runtime + one task per server wrapping irc::client::Client
-  format.rs        irc::proto::Message -> display line / speech text
+  net.rs           one tokio task per server: TCP/TLS, registration, PING, CTCP (step 10)
+  format.rs        irc_proto::Message -> display line / speech text
   ui/
     mod.rs
     main_frame.rs  frame, menus, notebook, routing events to tabs
@@ -38,29 +38,27 @@ src/
 ### Threading
 
 - **GUI thread** owns every widget, the prismer backend and all application state (tabs, speech flags).
-- **Networking uses the [`irc`](https://crates.io/crates/irc) crate (1.1.0)**, which is async and needs tokio. A multi-threaded tokio runtime is created in `main` before `wxdragon::main` and lives for the whole program; the GUI keeps its `Handle` to spawn work.
-- **One tokio task per connected server.** It builds an `irc::client::data::Config`, calls `Client::from_config(cfg).await`, then `client.identify()`, then loops over `client.stream()` and forwards each `Message` to the GUI.
-- **GUI → network:** the GUI holds a clone of the client's `irc::client::Sender` (it is `Clone` and thread-safe, and sending is synchronous), so typed messages are sent straight from the GUI thread with `send_privmsg`, `send_join`, `send(Command::Raw(..))` and so on. No extra channel is needed.
+- **Networking:** a multi-threaded tokio runtime is created in `main` before `wxdragon::main` and lives for the whole program; the GUI keeps its `Handle` to spawn work. Messages are parsed and serialised with [`irc-proto`](https://crates.io/crates/irc-proto); everything else is our own code in `net.rs` (step 10 replaced the `irc` crate's client).
+- **One tokio task per connected server.** It connects (TLS through `tokio-native-tls`), registers, then reads lines and forwards each `Message` to the GUI.
+- **GUI → network:** the GUI holds a clone of `net::Sender`, a wrapper around an unbounded channel (`Clone`, thread-safe, sending never blocks), with `send`, `send_privmsg`, `send_action` and `send_quit`. Typed raw lines go through `net::send_raw`.
 - **Network → GUI:** post a closure with wxDragon's `call_after` (check exact name in `docs/events.md` during step 0). Fallback if that doesn't work well: an `mpsc::Receiver` drained by a wx `Timer` every ~50 ms.
 - Events: `Connected`, `Message(irc::proto::Message)`, `NickChanged(String)`, `Disconnected(reason)`. Each carries a `ServerId` so the GUI knows which server tab group it belongs to.
 
-### What the `irc` crate does for us
+### What `net.rs` does
 
-- Parsing and serialising messages (`irc::proto::Message`, `Command` enum with `PRIVMSG(target, text)` etc., tags, `source_nickname()`, `response_target()`).
-- Registration: `identify()` sends `CAP END`, `PASS` (when the password isn't empty), `NICK`, `USER`.
-- Replies to server `PING`s and sends its own; a dead connection ends the stream with `Error::PingTimeout` (`ping_time` / `ping_timeout` in `Config`).
-- Nick in use (`433`): tries each entry in `alt_nicks` in turn, then fails with `Error::NoUsableNick`. We'll fill `alt_nicks` with `nick_`, `nick__`, `nick___`.
-- Tracks our current nick: `client.current_nickname()`.
-- CTCP replies (`VERSION`, `PING`, `TIME`, `SOURCE`, `USERINFO`, `FINGER`) with the `ctcp` feature.
-- TLS: `use_tls`, with Windows' native TLS (`tls-native`, the default) or rustls (`tls-rust`).
-- Outgoing flood throttling (`burst_window_length`, `max_messages_in_burst`).
+- Registration: `PASS` (when the password isn't empty), `NICK`, `USER`.
+- Nick in use or invalid (`433`/`432`) before `001`: tries `nick_`, `nick__`, `nick___` in turn, then gives up with "Every nickname is in use." (no retry). After registration the user picks their own nick.
+- Tracks our nick: from `001`'s first parameter and from `NICK` messages whose source is us. `NickChanged` is sent after the message that caused it, so the GUI routes that message with the old nick.
+- Answers server `PING`s. PINGs the server every 180 s; if no line at all arrives within 20 s after that, the connection is dropped.
+- CTCP replies to `VERSION`, `PING`, `TIME`, `CLIENTINFO` (as `NOTICE`s to the sender, never to our own messages).
+- `connect_commands` are sent when `001` arrives.
+- Lines are read as bytes and decoded lossily, so invalid UTF-8 becomes `\u{FFFD}`; a line that fails to parse is reported as `NetEvent::Error` and the connection carries on. Lines over 16 KiB are cut. Outgoing messages are cut at any CR/LF so a message can't carry a second command.
+- No outgoing flood throttling (the `irc` crate had settings for it but never applied them).
 
 ### What we still do ourselves
 
-- **Connect commands:** the crate can auto-join `channels` from its config after the MOTD (`376`/`422`), but we want arbitrary raw lines. We leave `Config::channels` empty and send `connect_commands` ourselves when we see `001` (`RPL_WELCOME`), using `Command::Raw`.
-- **Our nick for mentions and routing:** `current_nickname()` lives on the `Client`, which stays inside the task. After each message the task compares it with the last value and sends `NickChanged` to the GUI when it changes.
-- **Reconnecting:** the crate doesn't reconnect. When the stream ends or errors, the task reports `Disconnected` and a new `Client` has to be created (step 8).
-- **Channel membership:** for routing other users' `QUIT`/`NICK` to the right tabs we keep our own per-channel nick sets. (The crate's `channel-lists` feature tracks users too, but only on the `Client` inside the task, so it's not easily usable from the GUI.)
+- **Reconnecting:** when the connection ends the task reports `Disconnected { retry }` and the GUI schedules a new one (step 8).
+- **Channel membership:** for routing other users' `QUIT`/`NICK` to the right tabs we keep our own per-channel nick sets in the GUI.
 
 ### Things to check early (steps 0 and 3)
 
@@ -288,8 +286,19 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 - `Config::log` defaults to true (a manual `Default` impl, also used for fields missing from the file). Settings has a "Log conversations" checkbox.
 - **Tested:** the app against a fake localhost server, with the server named `fake:net`. It wrote `logs/fake_net/{server,#Test,bob,bob_away,nul_}/2026-10-13.log`. Colour and bold codes were stripped, the ACTION went to bob's query log, and "Disconnected" went to every tab's log. Not tested yet: `/msg` without a tab, and the Settings checkbox.
 
+### Step 10 — Own connection loop
+- Replace `irc::client::Client` with our own task in `net.rs`, keeping `irc-proto` for `Message`. Needed for self-signed certificates: the client does its own TLS with no access to the server's certificate and can't be handed a stream.
+- `Registration` (replaces `irc_config`), `Sender`, `session` over any `AsyncRead + AsyncWrite`, `Connection::read_loop` / `handle_line`. See "What `net.rs` does" above.
+- Fixes our nick not following `/nick` (the client's `current_nickname()` only followed its alt-nick index).
+
+**Done.**
+- Dependencies: `irc` → `irc-proto` (no default features), plus `native-tls`, `tokio-native-tls`; `futures` dropped. Tokio gains `net`, `io-util`, `time`, `sync`, `macros`; `test-util` for tests.
+- Behaviour changes: no `CAP END` before registration; `/quit` with no reason sends a bare `QUIT` (the client sent "Powered by Rust."); no `FINGER`/`SOURCE`/`USERINFO` replies; CTCP replies go to the sender, not the channel; alt nicks only before `001`.
+- Unit tests run sessions over `tokio::io::duplex`: registration, PING/PONG, alt nicks and giving up, `001` nick and connect commands, our own and others' NICK, CTCP, bad and overlong lines, invalid UTF-8, server close, and the ping timeout (paused clock).
+- **Tested against 10.0.0.2 (Ergo 2.20)** with `examples/headless.rs` and a second raw client holding `tyler`: alt nick `tyler_`, `JOIN #test` after 001, CTCP VERSION and PING answered, FINGER ignored, `NICK tylerx` gave `our nick is now tylerx`, a message from the new nick arrived, QUIT closed cleanly. Port 6697 fails with "TLS handshake failed: ... root certificate which is not trusted" (Ergo's self-signed certificate; next step).
+
 ### Later
-- SASL PLAIN. The crate has no built-in SASL, so we'd send `CAP REQ :sasl` / `AUTHENTICATE` ourselves and replace `identify()` with our own registration sequence (it sends `CAP END` immediately).
+- SASL PLAIN: `CAP LS` / `CAP REQ :sasl` / `AUTHENTICATE` / `CAP END` in `Connection::register` and `handle_line`.
 - Nick list, tab completion of nicks.
 - Request `server-time` and suppress speech for ZNC playback buffer.
 

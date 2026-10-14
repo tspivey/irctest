@@ -24,7 +24,7 @@ fn main() {
     .clone();
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    let sender: Arc<Mutex<Option<irc::client::Sender>>> = Arc::default();
+    let sender: Arc<Mutex<Option<net::Sender>>> = Arc::default();
     let (done_tx, done_rx) = mpsc::channel();
 
     let sink_sender = sender.clone();

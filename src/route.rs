@@ -1,6 +1,6 @@
 //! Decides which tab an incoming message belongs in.
 
-use irc::proto::{ChannelExt, Command, Message, Response};
+use irc_proto::{ChannelExt, Command, Message, Response};
 
 use crate::format::parse_ctcp;
 

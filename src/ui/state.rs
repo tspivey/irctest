@@ -5,14 +5,13 @@ use std::collections::HashSet;
 use std::rc::{Rc, Weak};
 
 use chrono::{DateTime, Local};
-use irc::client::Sender;
-use irc::proto::{ChannelExt, Command, Message, Prefix, Response};
+use irc_proto::{ChannelExt, Command, Message, Prefix, Response};
 use irctest::commands::{Input, parse_input};
 use irctest::config::{Config, ServerConfig};
 use irctest::format::{format_message, message_time, parse_ctcp, spoken_channel, strip_formatting, timestamped};
 use irctest::history::History;
 use irctest::log::{Logger, SERVER_TARGET};
-use irctest::net::{self, EventSink, NetEvent, ServerId};
+use irctest::net::{self, EventSink, NetEvent, Sender, ServerId};
 use irctest::route::{Route, irc_eq, irc_lower, route};
 use irctest::speech::{Speech, mentions, should_speak};
 use tokio::runtime::Handle;
@@ -731,7 +730,7 @@ impl State {
             Input::Quit(reason) => {
                 if let Some(sender) = self.sender_or_complain(s, t) {
                     self.servers[s].user_quit = true;
-                    if let Err(e) = sender.send_quit(reason.unwrap_or_default()) {
+                    if let Err(e) = sender.send_quit(reason.as_deref().unwrap_or_default()) {
                         self.complain(s, t, &format!("Couldn't send: {e}"));
                     }
                 }

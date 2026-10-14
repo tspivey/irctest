@@ -1,6 +1,6 @@
 //! Parses what's typed in an input box. Executing it is up to the GUI.
 
-use irc::proto::ChannelExt;
+use irc_proto::ChannelExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {

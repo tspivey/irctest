@@ -4,7 +4,7 @@
 //! caller; this module only produces the text.
 
 use chrono::{DateTime, Local, TimeZone};
-use irc::proto::{ChannelExt, Command, Message, Prefix, Response};
+use irc_proto::{ChannelExt, Command, Message, Prefix, Response};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Formatted {
@@ -176,7 +176,7 @@ fn join_nonempty(head: &str, tail: &str) -> String {
 /// Removes mIRC formatting: bold, italics, underline, strikethrough, monospace, reverse,
 /// reset, `\x03` colours (`fg[,bg]`, 1-2 digits each) and `\x04` hex colours (6 hex digits each).
 ///
-/// Written here rather than using `irc::proto::FormattedStringExt`, which misses italics,
+/// Written here rather than using `irc_proto::FormattedStringExt`, which misses italics,
 /// strikethrough and monospace and mishandles some two-digit colour codes.
 pub fn strip_formatting(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
