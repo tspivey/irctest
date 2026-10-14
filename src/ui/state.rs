@@ -19,6 +19,7 @@ use tokio::task::AbortHandle;
 use wxdragon::prelude::*;
 
 use super::cert_dialog::CertificateChoice;
+use super::foreground::app_is_foreground;
 use super::tab::{Tab, set_page_text};
 
 pub type TabId = u64;
@@ -295,7 +296,7 @@ impl State {
         let Some((s, t)) = self.current_tab() else { return };
         let tab = &mut self.servers[s].tabs[t];
         let feedback = match tab.kind {
-            TabKind::Server => "Server tabs aren't spoken.".to_string(),
+            TabKind::Server => "The server tab is spoken while it's selected.".to_string(),
             TabKind::Channel | TabKind::Query => {
                 tab.speech = !tab.speech;
                 let name = if tab.kind == TabKind::Channel { spoken_channel(&tab.name) } else { &tab.name };
@@ -328,7 +329,10 @@ impl State {
     /// A problem with something the user typed: written to the tab and spoken (interrupting,
     /// and even with all speech off, since it answers the user's own action).
     fn complain(&mut self, s: usize, t: usize, text: &str) {
-        self.line(s, t, text);
+        // Not through `line`, which would speak it a second time in the server tab.
+        let now = Local::now();
+        self.servers[s].tabs[t].tab.append_line(&timestamped(now, text));
+        self.log_tab(s, t, now, text);
         self.speech.say(text, true);
     }
 
@@ -486,13 +490,22 @@ impl State {
 
     fn line_at(&mut self, s: usize, t: usize, time: DateTime<Local>, text: &str) {
         self.show(s, t, time, text);
-        let target = log_target(&self.servers[s].tabs[t]).to_string();
-        self.log(s, &target, time, text);
+        self.log_tab(s, t, time, text);
     }
 
-    /// Appends a line without logging it.
-    fn show(&self, s: usize, t: usize, time: DateTime<Local>, text: &str) {
+    /// Appends a line without logging it, and speaks it if it's in the server tab the user
+    /// is looking at.
+    fn show(&mut self, s: usize, t: usize, time: DateTime<Local>, text: &str) {
         self.servers[s].tabs[t].tab.append_line(&timestamped(time, text));
+        if self.servers[s].tabs[t].kind == TabKind::Server && self.current_tab() == Some((s, t)) && app_is_foreground() {
+            self.speech.message(text);
+        }
+    }
+
+    /// Writes a line to tab `t`'s log.
+    fn log_tab(&mut self, s: usize, t: usize, time: DateTime<Local>, text: &str) {
+        let target = log_target(&self.servers[s].tabs[t]).to_string();
+        self.log(s, &target, time, text);
     }
 
     /// Writes a line to `target`'s log, if logging is on. The first failure is shown in the
