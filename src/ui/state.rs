@@ -1,14 +1,16 @@
 //! Application state on the GUI thread: servers, their tabs, routing and typed commands.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
 use chrono::{DateTime, Local};
-use irc_proto::{ChannelExt, Command, Message, Prefix, Response};
-use irctest::commands::{Input, parse_input};
+use irc_proto::{ChannelExt, ChannelMode, Command, Message, Mode, Prefix, Response};
+use irctest::commands::{Input, join_lines, parse_input, parse_join};
 use irctest::config::{Config, ServerConfig};
-use irctest::format::{format_message, message_time, parse_ctcp, spoken_channel, strip_formatting, timestamped};
+use irctest::format::{
+    format_message, is_error_reply, message_time, parse_ctcp, spoken_channel, strip_formatting, timestamped,
+};
 use irctest::history::History;
 use irctest::log::{Logger, SERVER_TARGET};
 use irctest::net::{self, CertificatePrompt, EventSink, NetEvent, Sender, ServerId};
@@ -41,6 +43,10 @@ pub struct ChatTab {
     speech: bool,
     /// Channels: whether we're currently in it.
     joined: bool,
+    /// Channels: we were in it when the connection dropped, so join it again on the next 001.
+    rejoin: bool,
+    /// Channels: the key we joined with, or the one set since (+k). Kept for rejoining; never saved.
+    key: Option<String>,
     /// Channels: who's in it, as `irc_lower` nicks. Used to route QUIT and NICK.
     nicks: HashSet<String>,
     /// Lines typed into this tab, for Up/Down.
@@ -59,6 +65,11 @@ pub struct Server {
     tabs: Vec<ChatTab>,
     /// `irc_lower` channels we asked to join, whose tabs get selected when the JOIN arrives.
     pending_select: HashSet<String>,
+    /// Keys from JOINs we sent, by `irc_lower` channel, until the JOIN arrives and moves the key
+    /// into the channel's tab.
+    pending_keys: HashMap<String, String>,
+    /// Seen 001 on the current connection.
+    registered: bool,
     /// The user disconnected on purpose (/quit, Server → Disconnect): don't reconnect.
     user_quit: bool,
     /// Reconnect attempts since the last successful registration, for the backoff.
@@ -272,6 +283,8 @@ impl State {
             nick: String::new(),
             tabs: Vec::new(),
             pending_select: HashSet::new(),
+            pending_keys: HashMap::new(),
+            registered: false,
             user_quit: false,
             attempts: 0,
             reconnect_timer,
@@ -404,6 +417,8 @@ impl State {
                 tab,
                 speech: kind != TabKind::Server,
                 joined: false,
+                rejoin: false,
+                key: None,
                 nicks: HashSet::new(),
                 history: History::default(),
             },
@@ -497,9 +512,14 @@ impl State {
     /// is looking at.
     fn show(&mut self, s: usize, t: usize, time: DateTime<Local>, text: &str) {
         self.servers[s].tabs[t].tab.append_line(&timestamped(time, text));
-        if self.servers[s].tabs[t].kind == TabKind::Server && self.current_tab() == Some((s, t)) && app_is_foreground() {
+        if self.speaks_lines(s, t) {
             self.speech.message(text);
         }
+    }
+
+    /// Whether every line shown in tab `t` is spoken: it's a server tab the user is looking at.
+    fn speaks_lines(&self, s: usize, t: usize) -> bool {
+        self.servers[s].tabs[t].kind == TabKind::Server && self.current_tab() == Some((s, t)) && app_is_foreground()
     }
 
     /// Writes a line to tab `t`'s log.
@@ -598,7 +618,11 @@ impl State {
         server.sender = None;
         server.task = None;
         server.pending_select.clear();
+        server.pending_keys.clear();
+        server.registered = false;
         for tab in &mut server.tabs {
+            // Or-ed: a failed reconnect attempt mustn't forget the channels from before it.
+            tab.rejoin |= tab.joined;
             tab.joined = false;
             tab.nicks.clear();
         }
@@ -608,7 +632,8 @@ impl State {
     }
 
     fn handle_message(&mut self, s: usize, msg: &Message) {
-        if matches!(msg.command, Command::Response(Response::RPL_WELCOME, _)) {
+        let welcome = matches!(msg.command, Command::Response(Response::RPL_WELCOME, _));
+        if welcome {
             // Registered: the next drop starts the backoff from the beginning.
             self.servers[s].attempts = 0;
         }
@@ -622,9 +647,60 @@ impl State {
             if let (Some(speech), Some(&t)) = (&formatted.speech, tabs.first()) {
                 self.maybe_speak(s, t, msg, &me, speech);
             }
+            if let Some(&t) = tabs.first() {
+                self.speak_error(s, t, msg, &formatted.text);
+            }
         }
         // After display: QUIT and NICK are routed by who was in each channel beforehand.
         self.update_membership(s, msg, &me);
+        if welcome {
+            self.servers[s].registered = true;
+            self.rejoin(s);
+        }
+    }
+
+    /// Speaks a server error reply wherever it's shown: it usually answers something the user
+    /// did. Spoken even with all speech off, like `complain`. Nick errors before 001 aren't
+    /// spoken: the connection tries the alternative nicks by itself.
+    fn speak_error(&mut self, s: usize, t: usize, msg: &Message, text: &str) {
+        if !is_error_reply(msg) {
+            return;
+        }
+        let nick_error =
+            matches!(msg.command, Command::Response(Response::ERR_NICKNAMEINUSE | Response::ERR_ERRONEOUSNICKNAME, _));
+        if nick_error && !self.servers[s].registered {
+            return;
+        }
+        // `show` has already spoken it.
+        if self.speech.enabled && self.speaks_lines(s, t) {
+            return;
+        }
+        self.speech.say(text, true);
+    }
+
+    /// Joins the channels we were in before the connection dropped, with their keys.
+    fn rejoin(&mut self, s: usize) {
+        let Some(sender) = self.servers[s].sender.clone() else { return };
+        let mut channels = Vec::new();
+        for tab in &mut self.servers[s].tabs {
+            if std::mem::take(&mut tab.rejoin) {
+                channels.push((tab.name.clone(), tab.key.clone()));
+            }
+        }
+        for line in join_lines(&channels) {
+            if let Err(e) = net::send_raw(&sender, &line) {
+                self.line(s, 0, &format!("Couldn't rejoin: {e}"));
+            }
+        }
+    }
+
+    /// Notes the keys of a JOIN we're sending, for when the server confirms it.
+    fn note_join(&mut self, s: usize, args: &str) {
+        for (channel, key) in parse_join(args) {
+            if let Some(key) = key {
+                self.servers[s].pending_keys.insert(irc_lower(&channel), key);
+            }
+        }
     }
 
     /// Speaks a PRIVMSG shown in tab `t` if the speech settings allow it.
@@ -678,10 +754,16 @@ impl State {
         match &msg.command {
             Command::JOIN(channel, _, _) => {
                 if let Some(t) = self.find_tab(s, channel) {
-                    let tab = &mut self.servers[s].tabs[t];
+                    let server = &mut self.servers[s];
+                    let tab = &mut server.tabs[t];
                     if is_me(source) {
                         tab.joined = true;
+                        tab.rejoin = false;
                         tab.nicks.clear();
+                        // Joined without a key (a rejoin, say): keep the one we had.
+                        if let Some(key) = server.pending_keys.remove(&irc_lower(channel)) {
+                            tab.key = Some(key);
+                        }
                     }
                     tab.nicks.insert(irc_lower(source));
                 }
@@ -710,6 +792,22 @@ impl State {
                     }
                 }
             }
+            Command::ChannelMODE(channel, modes) => {
+                if let Some(t) = self.find_tab(s, channel) {
+                    let tab = &mut self.servers[s].tabs[t];
+                    for mode in modes {
+                        match mode {
+                            Mode::Plus(ChannelMode::Key, Some(key)) => tab.key = Some(key.clone()),
+                            Mode::Minus(ChannelMode::Key, _) => tab.key = None,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // The key we tried was wrong: don't keep it.
+            Command::Response(Response::ERR_BADCHANNELKEY, args) if args.len() >= 2 => {
+                self.servers[s].pending_keys.remove(&irc_lower(&args[1]));
+            }
             Command::Response(Response::RPL_NAMREPLY, args) if args.len() >= 4 => {
                 if let Some(t) = self.find_tab(s, &args[2]) {
                     let tab = &mut self.servers[s].tabs[t];
@@ -733,6 +831,7 @@ impl State {
             let tab = &mut self.servers[s].tabs[t];
             if was_me {
                 tab.joined = false;
+                tab.rejoin = false;
                 tab.nicks.clear();
             } else {
                 tab.nicks.remove(&irc_lower(nick));
@@ -754,6 +853,9 @@ impl State {
                 let _ = text;
                 self.complain(s, t, "This is a server tab. Type /command to send a raw IRC command, e.g. /join #channel.");
             }
+            Input::Say(_) | Input::Me(_) if self.parted(s, t) => {
+                self.complain(s, t, &format!("You're not in {target}. Use /join {target} to rejoin."));
+            }
             Input::Say(text) => self.privmsg(s, t, &target, &text, false),
             Input::Me(text) => self.privmsg(s, t, &target, &text, true),
             Input::Msg { target, text } => self.privmsg(s, t, &target, &text, false),
@@ -763,6 +865,7 @@ impl State {
                     for channel in channels.split(',').filter(|c| !c.is_empty()) {
                         self.servers[s].pending_select.insert(irc_lower(channel));
                     }
+                    self.note_join(s, &args);
                     self.send_raw(s, t, &sender, &format!("JOIN {args}"));
                 }
             }
@@ -772,6 +875,13 @@ impl State {
                     None if kind == TabKind::Channel => target,
                     None => return self.complain(s, t, "Not in a channel. Use /part #channel."),
                 };
+                if self.servers[s].sender.is_none() {
+                    // Nothing to part, but don't join it again on reconnect.
+                    if let Some(c) = self.find_tab(s, &channel).filter(|&c| self.servers[s].tabs[c].rejoin) {
+                        self.servers[s].tabs[c].rejoin = false;
+                        return self.complain(s, t, &format!("Not connected. {channel} won't be rejoined."));
+                    }
+                }
                 if let Some(sender) = self.sender_or_complain(s, t) {
                     let line = match reason {
                         Some(reason) => format!("PART {channel} :{reason}"),
@@ -805,8 +915,11 @@ impl State {
             Input::Close => self.close_tab(s, t),
             Input::Raw(line) => {
                 if let Some(sender) = self.sender_or_complain(s, t) {
-                    if line.split_whitespace().next().is_some_and(|c| c.eq_ignore_ascii_case("QUIT")) {
+                    let (command, args) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
+                    if command.eq_ignore_ascii_case("QUIT") {
                         self.servers[s].user_quit = true;
+                    } else if command.eq_ignore_ascii_case("JOIN") {
+                        self.note_join(s, args);
                     }
                     self.send_raw(s, t, &sender, &line);
                 }
@@ -862,6 +975,13 @@ impl State {
             }
             Err(e) => self.complain(s, t, &format!("Couldn't send: {e}")),
         }
+    }
+
+    /// A channel tab we're not in while connected (parted, kicked, or not yet rejoined).
+    /// While disconnected, "Not connected." says more.
+    fn parted(&self, s: usize, t: usize) -> bool {
+        let tab = &self.servers[s].tabs[t];
+        tab.kind == TabKind::Channel && !tab.joined && self.servers[s].sender.is_some()
     }
 
     fn sender_or_complain(&mut self, s: usize, t: usize) -> Option<Sender> {

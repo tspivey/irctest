@@ -91,6 +91,61 @@ fn non_empty(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// The channels in a JOIN's arguments (`#a,#b key1,key2`), each with its key: keys pair with
+/// channels by position. An empty or `*` key means none. Anything that isn't a channel name
+/// (such as `JOIN 0`) is left out.
+pub fn parse_join(args: &str) -> Vec<(String, Option<String>)> {
+    let mut words = args.split_whitespace();
+    let channels = words.next().unwrap_or("");
+    let mut keys = words.next().unwrap_or("").split(',');
+    channels
+        .split(',')
+        .map(|channel| {
+            let key = keys.next().filter(|k| !k.is_empty() && *k != "*").map(str::to_string);
+            (channel.to_string(), key)
+        })
+        .filter(|(channel, _)| channel.is_channel_name())
+        .collect()
+}
+
+/// The longest JOIN line we send, without the CR LF.
+const MAX_JOIN_LINE: usize = 510;
+
+/// JOIN lines for these channels, each line at most 510 bytes. Channels with keys go first,
+/// since the server pairs keys with channels by position.
+pub fn join_lines(channels: &[(String, Option<String>)]) -> Vec<String> {
+    let keyed = channels.iter().filter_map(|(c, k)| k.as_deref().map(|k| (c.as_str(), Some(k))));
+    let unkeyed = channels.iter().filter(|(_, k)| k.is_none()).map(|(c, _)| (c.as_str(), None));
+    let mut lines = Vec::new();
+    let (mut names, mut keys): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    for (channel, key) in keyed.chain(unkeyed) {
+        names.push(channel);
+        keys.extend(key);
+        if names.len() > 1 && join_line(&names, &keys).len() > MAX_JOIN_LINE {
+            // Doesn't fit: send the line without it, and start the next one with it.
+            names.pop();
+            if key.is_some() {
+                keys.pop();
+            }
+            lines.push(join_line(&names, &keys));
+            names = vec![channel];
+            keys = key.into_iter().collect();
+        }
+    }
+    if !names.is_empty() {
+        lines.push(join_line(&names, &keys));
+    }
+    lines
+}
+
+fn join_line(names: &[&str], keys: &[&str]) -> String {
+    if keys.is_empty() {
+        format!("JOIN {}", names.join(","))
+    } else {
+        format!("JOIN {} {}", names.join(","), keys.join(","))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +182,45 @@ mod tests {
         assert_eq!(p("/part"), Input::Part { channel: None, reason: None });
         assert_eq!(p("/part bye all"), Input::Part { channel: None, reason: Some("bye all".into()) });
         assert_eq!(p("/part #x see you"), Input::Part { channel: Some("#x".into()), reason: Some("see you".into()) });
+    }
+
+    #[test]
+    fn join_args() {
+        let k = |c: &str, k: Option<&str>| (c.to_string(), k.map(str::to_string));
+        assert_eq!(parse_join("#a"), vec![k("#a", None)]);
+        assert_eq!(parse_join("#a,#b k1"), vec![k("#a", Some("k1")), k("#b", None)]);
+        assert_eq!(parse_join("#a,#b,#c *,k2"), vec![k("#a", None), k("#b", Some("k2")), k("#c", None)]);
+        assert_eq!(parse_join("#a,,#b k1,,k2"), vec![k("#a", Some("k1")), k("#b", Some("k2"))]);
+        assert_eq!(parse_join("0"), vec![]);
+    }
+
+    #[test]
+    fn join_lines_put_keyed_channels_first() {
+        let k = |c: &str, k: Option<&str>| (c.to_string(), k.map(str::to_string));
+        assert_eq!(join_lines(&[]), Vec::<String>::new());
+        assert_eq!(join_lines(&[k("#a", None), k("#b", None)]), vec!["JOIN #a,#b"]);
+        assert_eq!(
+            join_lines(&[k("#test", None), k("#secret", Some("k1")), k("#other", Some("k2"))]),
+            vec!["JOIN #secret,#other,#test k1,k2"]
+        );
+    }
+
+    #[test]
+    fn join_lines_split_at_the_limit() {
+        let channels: Vec<(String, Option<String>)> =
+            (0..100).map(|n| (format!("#channel{n:03}"), (n % 3 == 0).then(|| format!("key{n:03}")))).collect();
+        let lines = join_lines(&channels);
+        assert!(lines.len() > 1);
+        let mut seen = Vec::new();
+        for line in &lines {
+            assert!(line.len() <= MAX_JOIN_LINE, "{} bytes", line.len());
+            seen.extend(parse_join(line.strip_prefix("JOIN ").unwrap()));
+        }
+        // Every channel once, with its own key.
+        seen.sort();
+        let mut expected = channels.clone();
+        expected.sort();
+        assert_eq!(seen, expected);
     }
 
     #[test]

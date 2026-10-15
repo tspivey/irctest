@@ -171,6 +171,17 @@ pub fn parse_ctcp(text: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Whether this is a server error reply (a 4xx or 5xx numeric), including numerics irc-proto
+/// doesn't know.
+pub fn is_error_reply(msg: &Message) -> bool {
+    let code = match &msg.command {
+        Command::Response(response, _) => *response as u16,
+        Command::Raw(cmd, _) if is_numeric(cmd) => cmd.parse().unwrap_or(0),
+        _ => return false,
+    };
+    (400..600).contains(&code)
+}
+
 fn is_numeric(cmd: &str) -> bool {
     cmd.len() == 3 && cmd.bytes().all(|b| b.is_ascii_digit())
 }
@@ -237,6 +248,17 @@ mod tests {
 
     fn text(line: &str) -> String {
         fmt(line).unwrap().text
+    }
+
+    #[test]
+    fn error_replies() {
+        let e = |line: &str| is_error_reply(&line.parse::<Message>().unwrap());
+        assert!(e(":srv 403 tyler #test :No such channel\r\n"));
+        assert!(e(":srv 475 tyler #test :Cannot join channel (+k)\r\n"));
+        assert!(e(":srv 599 tyler :made up\r\n"));
+        assert!(!e(":srv 332 tyler #test :topic\r\n"));
+        assert!(!e(":srv 600 tyler :watch\r\n"));
+        assert!(!e(":bob!b@h PRIVMSG #test :403\r\n"));
     }
 
     #[test]
