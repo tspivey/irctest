@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=irctest
+Comment=IRC client
+Exec=irctest
+Icon=irctest
+Categories=Network;Chat;IRCClient;
+Terminal=false

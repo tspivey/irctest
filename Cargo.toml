@@ -3,6 +3,9 @@ name = "irctest"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["xtask"]
+
 [dependencies]
 wxdragon = "0.9"
 prismer = { version = "0.1", features = ["static"] }
