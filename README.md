@@ -172,14 +172,17 @@ accepted live messages and reconnect catch-up are logged using their original
 dates. Startup context and explicit older `/history` pages are display-only.
 Deduplication avoids logging the same accepted message again within the process.
 
-`irctest-state.toml`, next to the configuration, stores received cursors, recent
-message IDs, and shared read timestamps. Received cursors and read markers are
+`irctest-state.toml`, next to the configuration, stores received cursors and
+shared read timestamps. A conversation with nothing received or read in 30 days is
+dropped at startup. Received cursors and read markers are
 separate: fetching a message does not mark it read. State is scoped by saved
 account name, endpoint, TLS mode, authentication identity, network ID, and
 conversation. Writes use atomic replacement, a single writer, a two-second
 debounce, and a shutdown flush. Invalid or unsupported state is left untouched
 and uses memory-only state for that run. Write failures are reported without
-interrupting chat.
+interrupting chat. It also remembers which channels and queries F5 turned speech
+off for, by server name, network, and conversation only, so changing the nick,
+username, or address keeps those settings.
 
 Passwords are excluded from state identity. If a PASS-only login changes account
 solely by changing its password, the client cannot distinguish the old and new
@@ -229,7 +232,7 @@ Resource limits are:
 - At most 128 active batches per connection, nested at most 16 levels deep.
 - At most 1,000 buffered messages per history request and a combined 4 MiB
   history text buffer per connection.
-- At most 4,096 recent message IDs per conversation; the latest 256 persist.
+- At most 4,096 recent message IDs per conversation, kept in memory only.
 - At most 10,000 displayed lines per tab.
 
 Retrieval stops on exhaustion, errors, timeout, capability removal, or lack of

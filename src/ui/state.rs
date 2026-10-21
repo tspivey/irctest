@@ -372,7 +372,9 @@ impl State {
                 .get(&key)
                 .cloned()
                 .unwrap_or_default();
+            let speech = self.speech_saved(s, &target);
             let tab = &mut self.servers[s].tabs[t];
+            tab.speech = speech;
             tab.deduper = Deduper::new(if cold { &[] } else { &state.recent_ids });
             tab.oldest = None;
             tab.history_boundary = None;
@@ -799,6 +801,17 @@ impl State {
                 )
             }
         };
+        let tab = &self.servers[s].tabs[t];
+        if tab.kind != TabKind::Server {
+            let on = tab.speech;
+            let key = self.speech_key(s, &tab.name);
+            if on {
+                self.sync_data.speech_off.remove(&key);
+            } else {
+                self.sync_data.speech_off.insert(key);
+            }
+            self.writer.update(self.sync_data.clone());
+        }
         self.feedback(s, t, &feedback);
     }
 
@@ -978,6 +991,7 @@ impl State {
                 .conversations
                 .get(&key)
                 .and_then(|c| c.read.clone());
+            self.servers[s].tabs[t].speech = self.speech_saved(s, name);
             if self.servers[s].ready {
                 let _ = self.servers[s].markers.restore(name, read.as_deref());
             }
@@ -1055,6 +1069,11 @@ impl State {
     fn rename_tab(&mut self, s: usize, t: usize, name: &str) {
         let old = self.servers[s].tabs[t].name.clone();
         self.close_log(s, t);
+        let old_speech = self.speech_key(s, &old);
+        if self.sync_data.speech_off.remove(&old_speech) {
+            self.sync_data.speech_off.insert(self.speech_key(s, name));
+            self.writer.update(self.sync_data.clone());
+        }
         let old_key = self.conversation_key(s, &old);
         let new_key = self.conversation_key(s, name);
         if old_key != new_key {
@@ -1300,6 +1319,19 @@ impl State {
             target: target.into(),
         }
         .canonical()
+    }
+    fn speech_key(&self, s: usize, target: &str) -> String {
+        irctest::sync_state::speech_key(
+            &self.servers[s].config.name,
+            self.servers[s].actual_network.as_deref(),
+            target,
+        )
+    }
+    fn speech_saved(&self, s: usize, target: &str) -> bool {
+        !self
+            .sync_data
+            .speech_off
+            .contains(&self.speech_key(s, target))
     }
     fn line_count(&self, s: usize, t: usize) -> usize {
         self.servers[s].tabs[t].tab.line_count()

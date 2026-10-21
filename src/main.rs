@@ -18,7 +18,10 @@ fn main() {
     let handle = runtime.handle().clone();
     let path = std::path::PathBuf::from(irctest::sync_state::STATE_FILE);
     let (sync_data, sync_error) = match irctest::sync_state::load(&path) {
-        Ok(data) => (data, None),
+        Ok(mut data) => {
+            data.prune_stale(chrono::Utc::now());
+            (data, None)
+        }
         Err(error) => (Default::default(), Some(error)),
     };
     let writer = irctest::sync_state::Writer::spawn(&handle, path, sync_error.is_none());

@@ -1,7 +1,7 @@
 use crate::config::{Config, ServerConfig};
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
@@ -68,6 +68,16 @@ impl ConversationKey {
         ])
     }
 }
+/// Where a conversation's speech setting is kept: the configured server name, the
+/// bouncer network if any, and the conversation. Unlike `ConversationKey` it leaves out the
+/// endpoint and login, so changing the nick, username or address keeps the setting.
+pub fn speech_key(server: &str, network_id: Option<&str>, target: &str) -> String {
+    encode(&[
+        server,
+        network_id.unwrap_or(""),
+        &crate::route::irc_lower(target),
+    ])
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     pub time: String,
@@ -77,7 +87,9 @@ pub struct Cursor {
 pub struct ConversationState {
     pub received: Option<Cursor>,
     pub read: Option<String>,
-    #[serde(default)]
+    /// For deduplicating a tab opened again after a reconnect. Kept in memory only: a
+    /// restart starts every tab empty and doesn't use them.
+    #[serde(skip)]
     pub recent_ids: Vec<String>,
 }
 pub fn timestamp(value: &str) -> Result<DateTime<FixedOffset>, String> {
@@ -116,13 +128,34 @@ pub struct SyncData {
     pub version: u32,
     #[serde(default)]
     pub conversations: BTreeMap<String, ConversationState>,
+    /// `speech_key`s of conversations F5 turned speech off for.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub speech_off: BTreeSet<String>,
 }
 impl Default for SyncData {
     fn default() -> Self {
         Self {
             version: 1,
             conversations: BTreeMap::new(),
+            speech_off: BTreeSet::new(),
         }
+    }
+}
+/// Conversations with nothing received or read for this long are forgotten.
+pub const STALE_AFTER: chrono::Duration = chrono::Duration::days(30);
+impl SyncData {
+    /// Drops conversations whose newest received message and read marker are both older
+    /// than `STALE_AFTER`. Speech settings are kept.
+    pub fn prune_stale(&mut self, now: DateTime<Utc>) {
+        let cutoff = now - STALE_AFTER;
+        self.conversations.retain(|_, state| {
+            let received = state.received.as_ref().map(|c| c.time.as_str());
+            [received, state.read.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|time| timestamp(time).ok())
+                .any(|time| time >= cutoff)
+        });
     }
 }
 pub fn load(path: &Path) -> Result<SyncData, String> {
@@ -146,9 +179,6 @@ fn validate(data: &mut SyncData) -> Result<(), String> {
         }
         if let Some(t) = &state.read {
             timestamp(t)?;
-        }
-        if state.recent_ids.len() > 256 {
-            state.recent_ids.drain(..state.recent_ids.len() - 256);
         }
     }
     Ok(())
@@ -322,6 +352,53 @@ mod tests {
         data
     }
     #[test]
+    fn prune_stale_drops_old_conversations_and_keeps_speech() {
+        let now = timestamp("2026-10-21T12:00:00Z").unwrap().to_utc();
+        let cursor = |time: &str| Cursor {
+            time: time.into(),
+            msgid: None,
+        };
+        let mut data = SyncData::default();
+        let mut state = |received: Option<&str>, read: Option<&str>| ConversationState {
+            received: received.map(cursor),
+            read: read.map(Into::into),
+            recent_ids: Vec::new(),
+        };
+        let recent = state(Some("2026-10-20T00:00:00Z"), None);
+        let old = state(Some("2026-08-01T00:00:00Z"), Some("2026-08-01T00:00:00Z"));
+        let read_recently = state(Some("2026-08-01T00:00:00Z"), Some("2026-10-01T00:00:00Z"));
+        let empty = state(None, None);
+        data.conversations.insert("recent".into(), recent);
+        data.conversations.insert("old".into(), old);
+        data.conversations.insert("read".into(), read_recently);
+        data.conversations.insert("empty".into(), empty);
+        data.speech_off.insert(speech_key("Net", None, "#old"));
+        data.prune_stale(now);
+        let kept: Vec<_> = data.conversations.keys().map(String::as_str).collect();
+        assert_eq!(kept, ["read", "recent"]);
+        assert_eq!(data.speech_off.len(), 1);
+    }
+    #[test]
+    fn speech_off_survives_save_and_load() {
+        let path = temp_path("speech");
+        let mut data = SyncData::default();
+        data.speech_off
+            .insert(speech_key("Bouncer", Some("7"), "#Quiet"));
+        save(&path, &data).unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(
+            loaded
+                .speech_off
+                .contains(&speech_key("Bouncer", Some("7"), "#quiet"))
+        );
+        assert!(
+            !loaded
+                .speech_off
+                .contains(&speech_key("Bouncer", None, "#quiet"))
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+    #[test]
     fn conversation_namespaces_isolate_endpoint_accounts_and_opaque_networks() {
         let config = Config {
             username: "account".into(),
@@ -412,15 +489,13 @@ mod tests {
         assert!(!first.contains("private-pass"));
     }
     #[test]
-    fn save_rejects_invalid_data_and_trims_recent_ids() {
+    fn save_rejects_invalid_data_and_keeps_recent_ids_in_memory() {
         let path = temp_path("validation");
         let mut data = snapshot("chat");
-        data.conversations.get_mut("chat").unwrap().recent_ids =
-            (0..300).map(|n| n.to_string()).collect();
+        data.conversations.get_mut("chat").unwrap().recent_ids = vec!["saved-id".into()];
         save(&path, &data).unwrap();
-        let raw: SyncData = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(raw.conversations["chat"].recent_ids.len(), 256);
-        assert_eq!(raw.conversations["chat"].recent_ids[0], "44");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("recent_ids") && !text.contains("saved-id"));
         let original = std::fs::read(&path).unwrap();
         data.conversations.get_mut("chat").unwrap().read = Some("invalid".into());
         assert!(save(&path, &data).is_err());
