@@ -6,8 +6,8 @@ use std::rc::{Rc, Weak};
 
 use chrono::{DateTime, Local};
 use irc_proto::{ChannelExt, ChannelMode, Command, Message, Mode, Prefix, Response};
-use irctest::complete::{Completion, order};
 use irctest::commands::{Input, join_lines, parse_input, parse_join};
+use irctest::complete::{Completion, order};
 use irctest::config::{Config, ServerConfig};
 use irctest::format::{
     format_message, is_error_reply, message_time, parse_ctcp, spoken_channel, strip_formatting,
@@ -450,7 +450,28 @@ impl State {
         if !config.log {
             self.logger.close_all();
         }
+        for server in &mut self.servers {
+            server.active_config.ignored = config.ignored.clone();
+            if let Some(sender) = &server.sender {
+                sender.set_ignored(&config.ignored);
+            }
+        }
         self.config = config;
+    }
+
+    /// One checkbox per channel name; ignores apply equally to every network.
+    pub fn ignore_channels(&self) -> Vec<String> {
+        let mut channels = Vec::new();
+        for server in &self.servers {
+            for tab in &server.tabs {
+                if tab.kind == TabKind::Channel && !irctest::ignore::contains(&channels, &tab.name)
+                {
+                    channels.push(tab.name.clone());
+                }
+            }
+        }
+        channels.sort_by_key(|name| irc_lower(name));
+        channels
     }
 
     /// Connects every server marked auto-connect.
@@ -499,7 +520,7 @@ impl State {
         if self.shutting_down || self.servers[s].task.is_some() {
             return;
         }
-        let active_config = if let Some(parent) = self.servers[s].parent {
+        let mut active_config = if let Some(parent) = self.servers[s].parent {
             let Some(parent) = self.servers.iter().position(|p| p.id == parent) else {
                 return;
             };
@@ -507,6 +528,7 @@ impl State {
         } else {
             self.config.clone()
         };
+        active_config.ignored = self.config.ignored.clone();
         let account = AccountKey::from_config(&active_config, &self.servers[s].config);
         let changed = account != self.servers[s].account_key;
         if changed {
@@ -1541,6 +1563,13 @@ impl State {
             if first_cursor.is_none() {
                 first_cursor = cursor(&message);
             }
+            // Keep paging/receipt cursors moving even across fully ignored pages.
+            self.observe_chat(s, t, &message);
+            if (target.is_channel_name() && irctest::ignore::contains(&self.config.ignored, target))
+                || irctest::ignore::message_ignored(&self.config.ignored, &message)
+            {
+                continue;
+            }
             let time = message_time(&message);
             lines.push(if let Some(time) = time {
                 irctest::format::history_timestamped(time, &formatted.text)
@@ -1552,7 +1581,6 @@ impl State {
                     self.log_with_policy(s, target, time, &formatted.text, true);
                 }
             }
-            self.observe_chat(s, t, &message);
         }
         self.servers[s].tabs[t].deduper.end_history();
         update_page_oldest(&mut self.servers[s].tabs[t].oldest, reason, first_cursor);
@@ -2088,6 +2116,7 @@ impl State {
                 self.refresh_contexts(s);
             }
             NetEvent::Connected(sender) => {
+                sender.set_ignored(&self.config.ignored);
                 self.servers[s].sender = Some(sender);
                 self.line(s, 0, "Connected.");
             }
@@ -2232,6 +2261,10 @@ impl State {
     }
 
     fn handle_message(&mut self, s: usize, msg: &Message) {
+        let ignored = irctest::ignore::message_ignored(&self.config.ignored, msg);
+        if ignored && matches!(msg.command, Command::PRIVMSG(..) | Command::NOTICE(..)) {
+            return;
+        }
         let welcome = matches!(msg.command, Command::Response(Response::RPL_WELCOME, _));
         if welcome {
             self.servers[s].attempts = 0;
@@ -2239,7 +2272,18 @@ impl State {
         let me = self.servers[s].nick.clone();
         if let Some(formatted) = format_message(msg) {
             let time = message_time(msg).unwrap_or_else(Local::now);
-            let tabs = self.route_to_tabs(s, msg, &me);
+            let tabs: Vec<_> = self
+                .route_to_tabs(s, msg, &me)
+                .into_iter()
+                .filter(|&t| {
+                    !ignored
+                        && !(self.servers[s].tabs[t].kind == TabKind::Channel
+                            && irctest::ignore::contains(
+                                &self.config.ignored,
+                                &self.servers[s].tabs[t].name,
+                            ))
+                })
+                .collect();
             let chat = displayed_chat(msg);
             let quiet_ctcp = matches!(
                 &msg.command,
@@ -2685,15 +2729,19 @@ impl State {
     /// Sends a PRIVMSG (or ACTION) and shows it: in the target's tab if one is open,
     /// otherwise in the tab it was typed in.
     fn privmsg(&mut self, s: usize, t: usize, target: &str, text: &str, action: bool) {
-        let Some(sender) = self.sender_or_complain(s, t) else {
-            return;
-        };
         let body = if action {
             format!("\x01ACTION {text}\x01")
         } else {
             text.into()
         };
         let message: Message = Command::PRIVMSG(target.into(), body).into();
+        if irctest::ignore::outgoing_ignored(&self.config.ignored, &message.command) {
+            self.complain(s, t, "Person or channel on ignore.");
+            return;
+        }
+        let Some(sender) = self.sender_or_complain(s, t) else {
+            return;
+        };
         if let Err(error) = sender.send(message.clone()) {
             self.complain(s, t, &format!("Couldn't send: {error}"));
             return;
@@ -2715,6 +2763,12 @@ impl State {
     }
 
     fn send_raw(&mut self, s: usize, t: usize, sender: &Sender, line: &str) {
+        if let Ok(message) = line.trim().parse::<Message>() {
+            if irctest::ignore::outgoing_ignored(&self.config.ignored, &message.command) {
+                self.complain(s, t, "Person or channel on ignore.");
+                return;
+            }
+        }
         match net::send_raw(sender, line) {
             Ok(()) => {
                 if let Ok(message) = line.parse::<Message>() {

@@ -8,6 +8,7 @@ pub mod config;
 pub mod connections;
 pub mod format;
 pub mod history;
+pub mod ignore;
 pub mod log;
 pub mod net;
 pub mod playback;

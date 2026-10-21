@@ -8,6 +8,7 @@ use tokio::runtime::Handle;
 use wxdragon::prelude::*;
 
 use super::cert_dialog::ask_certificate;
+use super::ignore_dialog::edit_ignores;
 use super::richedit::disable_beep;
 use super::server_dialog::manage_servers;
 use super::settings_dialog::{Settings, edit_settings};
@@ -18,6 +19,7 @@ const ID_DISCONNECT: i32 = 1000;
 const ID_MANAGE_SERVERS: i32 = 1001;
 const ID_SETTINGS: i32 = 1002;
 const ID_RECONNECT: i32 = 1003;
+const ID_IGNORE: i32 = 1004;
 const ID_CLOSE_TAB: i32 = 1103;
 const ID_TOGGLE_SPEECH: i32 = 1101;
 const ID_TOGGLE_ALL_SPEECH: i32 = 1102;
@@ -171,6 +173,11 @@ impl MainFrame {
                 "Se&ttings...",
                 "Global nickname and other settings",
             )
+            .append_item(
+                ID_IGNORE,
+                "&Ignore...",
+                "Hide text from nicknames or channels",
+            )
             .append_separator()
             .append_item(ID_EXIT, "E&xit\tAlt+F4", "Quit irctest")
             .build();
@@ -279,6 +286,21 @@ impl MainFrame {
                         };
                         if let Err(e) = config.save() {
                             message(&frame, &format!("Couldn't save settings:\n\n{e}"));
+                        }
+                        state.borrow_mut().set_config(config);
+                    }
+                }
+                ID_IGNORE => {
+                    let (ignored, channels) = {
+                        let state = state.borrow();
+                        (state.config().ignored.clone(), state.ignore_channels())
+                    };
+                    if let Some(ignored) = edit_ignores(&frame, &ignored, &channels) {
+                        // Events can update settings while the modal dialog is open.
+                        let mut config = state.borrow().config().clone();
+                        config.ignored = ignored;
+                        if let Err(e) = config.save() {
+                            message(&frame, &format!("Couldn't save ignores:\n\n{e}"));
                         }
                         state.borrow_mut().set_config(config);
                     }

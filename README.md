@@ -37,6 +37,22 @@ Once you focus Output to review it, the client preserves the cursor and selectio
 when appending messages and adjusts them when inserting history or removing old
 lines. Each tab retains at most 10,000 output lines.
 
+Open Server, Ignore to hide messages from a nickname or channel. Type one name
+and choose Add, or check "Ignore this channel: #name" for an open channel.
+Channel boxes start unchecked; saved ignores appear checked when reopened.
+The Ignored names list includes both people and channels. Remove a selected
+entry or uncheck its channel to receive messages again. OK saves the list in
+`irctest.toml`; Cancel discards edits. A name still in the field is added by OK.
+Matches use exact IRC names, ignoring capitalization, on every network.
+Ignored text, notices and actions are hidden and silent, including newly
+retrieved history. Lines already displayed remain. Ignoring a channel leaves
+you joined to it. Sending to an ignored person or channel is also blocked,
+with "Person or channel on ignore." displayed and spoken. This covers plain
+messages, `/msg`, `/query` with a message, `/me`, notices, CTCP, and raw
+PRIVMSG/NOTICE commands. A send to multiple recipients is blocked in full if
+any recipient is ignored. Remove the ignore before sending again.
+Automatic replies and configured connection messages also respect the list.
+
 ## Configuration
 
 `irctest.toml` is loaded from the current working directory. A missing file gives
@@ -299,6 +315,7 @@ dbus-run-session -- xvfb-run -a python3 tests/gui_soju_networks.py
 dbus-run-session -- xvfb-run -a python3 tests/gui_history.py
 dbus-run-session -- xvfb-run -a python3 tests/gui_ctcp.py
 dbus-run-session -- xvfb-run -a python3 tests/gui_names.py
+dbus-run-session -- xvfb-run -a python3 tests/gui_ignore.py
 ```
 
 The soju regression uses a local fake bouncer with five networks to check that
@@ -310,6 +327,10 @@ wire framing, readable replies, usage help, quiet display and single display
 with and without `echo-message`.
 The names regression checks current-channel display and speech, membership
 updates, argument rejection, and that `/names` never sends a network request.
+The ignore regression checks keyboard controls, unchecked channel defaults,
+nickname/channel filtering for live messages and history, quiet ignored text,
+blocked outgoing commands and automatic replies, cancel, persistence across
+restart, and sending and receiving messages again after removal.
 
 On Linux, the existing packaging task builds a release AppImage:
 

@@ -19,6 +19,8 @@ pub struct Config {
     pub realname: String,
     /// Write conversations to `logs/<server>/<target>/YYYY-MM-DD.log`.
     pub log: bool,
+    /// Exact nicknames and channel names to hide, on every network.
+    pub ignored: Vec<String>,
     pub servers: Vec<ServerConfig>,
 }
 
@@ -29,6 +31,7 @@ impl Default for Config {
             username: String::new(),
             realname: String::new(),
             log: true,
+            ignored: Vec::new(),
             servers: Vec::new(),
         }
     }
@@ -184,6 +187,7 @@ mod tests {
             username: String::new(),
             realname: "Tyler".into(),
             log: false,
+            ignored: Vec::new(),
             servers: vec![ServerConfig {
                 name: "lan".into(),
                 host: "10.0.0.2".into(),
@@ -226,6 +230,22 @@ mod tests {
         let config = sample();
         config.save_to(&file.0).unwrap();
         assert_eq!(Config::load_from(&file.0).unwrap(), config);
+    }
+
+    #[test]
+    fn ignore_list_survives_config_save() {
+        let file = TempFile::new("ignored");
+        let config: Config = toml::from_str("ignored = ['Bob', '#quiet']\n").unwrap();
+        config.save_to(&file.0).unwrap();
+        let saved: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&file.0).unwrap()).unwrap();
+        assert_eq!(
+            saved.get("ignored").and_then(toml::Value::as_array),
+            Some(&vec![
+                toml::Value::String("Bob".into()),
+                toml::Value::String("#quiet".into())
+            ])
+        );
     }
 
     #[test]

@@ -6,8 +6,8 @@
 
 use std::fmt;
 use std::future::pending;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use base64::Engine;
@@ -127,6 +127,7 @@ impl CertificatePrompt {
 pub struct Sender(
     mpsc::UnboundedSender<Message>,
     mpsc::UnboundedSender<HistoryControl>,
+    Arc<RwLock<Vec<String>>>,
 );
 #[derive(Debug)]
 enum HistoryControl {
@@ -147,6 +148,11 @@ impl fmt::Display for Closed {
 impl std::error::Error for Closed {}
 
 impl Sender {
+    /// Update the final wire filter, including automatic replies and queued sends.
+    pub fn set_ignored(&self, ignored: &[String]) {
+        *self.2.write().expect("ignore list poisoned") = ignored.to_vec();
+    }
+
     pub fn history(&self, request: HistoryRequest) -> Result<(), Closed> {
         self.1
             .send(HistoryControl::Fetch(request))
@@ -200,6 +206,7 @@ pub struct Registration {
     pub realname: String,
     /// Raw lines sent after 001.
     pub connect_commands: Vec<String>,
+    pub ignored: Vec<String>,
     /// Account for SASL PLAIN.
     pub sasl_username: String,
     /// Blank = don't use SASL.
@@ -239,6 +246,7 @@ impl Registration {
             username: config.effective_username(server).to_string(),
             realname: config.effective_realname(server).to_string(),
             connect_commands: server.connect_commands.clone(),
+            ignored: config.ignored.clone(),
             sasl_username: match server.sasl_username.trim() {
                 "" => nick.to_string(),
                 user => user.to_string(),
@@ -409,11 +417,12 @@ where
     let (read, mut write) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (history_tx, history_rx) = mpsc::unbounded_channel();
+    let ignored = Arc::new(RwLock::new(reg.ignored.clone()));
     let mut conn = Connection {
         history: HistoryQueue::new(HistorySupport::default()),
         id,
         sink,
-        sender: Sender(tx, history_tx),
+        sender: Sender(tx, history_tx, ignored.clone()),
         nick: reg.nick.clone(),
         alt_nick: 0,
         registered: false,
@@ -446,6 +455,12 @@ where
     // Only ends with an error: `conn` holds a sender, so `rx` stays open.
     let writer = async move {
         while let Some(msg) = rx.recv().await {
+            if crate::ignore::outgoing_ignored(
+                &ignored.read().expect("ignore list poisoned"),
+                &msg.command,
+            ) {
+                continue;
+            }
             if matches!(msg.command, Command::QUIT(_)) {
                 closing.store(true, Ordering::Relaxed);
             }
@@ -1296,7 +1311,7 @@ mod tests {
     fn quit_without_reason() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (history_tx, _) = mpsc::unbounded_channel();
-        let sender = Sender(tx, history_tx);
+        let sender = Sender(tx, history_tx, Arc::default());
         sender.send_quit("").unwrap();
         sender.send_quit("bye").unwrap();
         assert_eq!(rx.try_recv().unwrap().to_string(), "QUIT\r\n");
@@ -1316,6 +1331,7 @@ mod tests {
             username: "tspivey".into(),
             realname: "Tyler S".into(),
             connect_commands: Vec::new(),
+            ignored: Vec::new(),
             sasl_username: String::new(),
             sasl_password: String::new(),
             pinned: String::new(),
@@ -2007,6 +2023,43 @@ mod tests {
         assert!(matches!(fake.event().await, NetEvent::NickChanged(n) if n == "tyler|"));
         assert_eq!(fake.recv().await, "JOIN #test");
         assert_eq!(fake.recv().await, "PRIVMSG NickServ :IDENTIFY x");
+    }
+
+    #[tokio::test]
+    async fn saved_ignores_block_connect_messages_and_automatic_replies() {
+        let config = Config {
+            nickname: "tyler".into(),
+            ignored: vec!["Bob".into(), "#quiet".into()],
+            ..Config::default()
+        };
+        let server = ServerConfig {
+            connect_commands: vec![
+                "PRIVMSG Bob :blocked configured message".into(),
+                "NOTICE #QUIET :blocked configured notice".into(),
+                "JOIN #quiet".into(),
+                "PRIVMSG Alice :allowed configured message".into(),
+            ],
+            ..server()
+        };
+        let mut fake = Fake::start_with(Registration::new(&config, &server, &[]).unwrap());
+        while !fake.recv().await.starts_with("USER") {}
+        fake.send("CAP * LS :").await;
+        assert_eq!(fake.recv().await, "CAP END");
+        fake.send(":srv 001 tyler :Welcome").await;
+        fake.send(":bOB!u@h PRIVMSG tyler :\x01VERSION\x01").await;
+        fake.send(":Alice!u@h PRIVMSG tyler :\x01VERSION\x01").await;
+        fake.send("PING :ignore-barrier").await;
+        assert_eq!(fake.recv().await, "JOIN #quiet");
+        assert_eq!(
+            fake.recv().await,
+            "PRIVMSG Alice :allowed configured message"
+        );
+        assert!(
+            fake.recv()
+                .await
+                .starts_with("NOTICE Alice :\x01VERSION irctest ")
+        );
+        assert_eq!(fake.recv().await, "PONG ignore-barrier");
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ fn account(attempt: u64, bind: Option<&str>) -> Registration {
         username: "account".into(),
         realname: "Screen Reader".into(),
         connect_commands: vec!["JOIN #configured".into()],
+        ignored: Vec::new(),
         sasl_username: "account".into(),
         sasl_password: "credential-secret".into(),
         pinned: "AA:BB".into(),
