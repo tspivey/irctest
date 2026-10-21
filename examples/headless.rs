@@ -24,13 +24,16 @@ fn main() {
     .unwrap_or_else(|| fail("No such server in irctest.toml"))
     .clone();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let sender: Arc<Mutex<Option<net::Sender>>> = Arc::default();
     let (done_tx, done_rx) = mpsc::channel();
 
     let sink_sender = sender.clone();
     let done_tx = Mutex::new(done_tx);
-    let sink: net::EventSink = Arc::new(move |id, event| match event {
+    let sink: net::EventSink = Arc::new(move |id, event| match event.event {
         NetEvent::Connected(s) => {
             println!("[{id}] connected");
             *sink_sender.lock().unwrap() = Some(s);
@@ -42,11 +45,42 @@ fn main() {
             },
             None => {}
         },
+        NetEvent::NetworkSnapshot(_)
+        | NetEvent::Role(_)
+        | NetEvent::Network(_)
+        | NetEvent::Capabilities(_)
+        | NetEvent::Batch(_) => {}
+        NetEvent::HistoryMessage { message, .. } => {
+            if let Some(f) = format_message(&message) {
+                println!("[{id}] history: {}", f.text);
+            }
+        }
+        NetEvent::HistoryComplete { messages, .. } => {
+            for m in messages {
+                if let Some(f) = format_message(&m) {
+                    println!("[{id}] history: {}", f.text);
+                }
+            }
+        }
+        NetEvent::HistoryTarget { target, .. } => println!("[{id}] history target: {target}"),
+        NetEvent::HistoryNotice { text, .. } => println!("[{id}] history: {text}"),
+        NetEvent::ReadMarkerFailed { text, .. } => println!("[{id}] {text}"),
+        NetEvent::ReadMarker(update) => println!(
+            "[{id}] read marker for {}: {:?}",
+            update.target, update.time
+        ),
         NetEvent::NickChanged(nick) => println!("[{id}] our nick is now {nick}"),
         NetEvent::Error(e) => println!("[{id}] error: {e}"),
         NetEvent::UntrustedCertificate(prompt) => {
-            let what = if prompt.changed { "changed" } else { "untrusted" };
-            println!("[{id}] {what} certificate ({}), trusting once: {}", prompt.reason, prompt.fingerprint);
+            let what = if prompt.changed {
+                "changed"
+            } else {
+                "untrusted"
+            };
+            println!(
+                "[{id}] {what} certificate ({}), trusting once: {}",
+                prompt.reason, prompt.fingerprint
+            );
             prompt.answer(true);
         }
         NetEvent::Disconnected { reason, .. } => {
@@ -55,8 +89,21 @@ fn main() {
         }
     });
 
-    println!("Connecting to {}:{} as {}", server.host, server.port, config.effective_nick(&server));
-    net::connect(runtime.handle(), 1, &config, &server, &[], sink);
+    println!(
+        "Connecting to {}:{} as {}",
+        server.host,
+        server.port,
+        config.effective_nick(&server)
+    );
+    net::connect(
+        runtime.handle(),
+        1,
+        &config,
+        &server,
+        &[],
+        net::SessionOptions::default(),
+        sink,
+    );
 
     // Disconnects can happen while we're blocked on stdin; check for one after each line.
     for line in std::io::stdin().lock().lines() {

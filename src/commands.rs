@@ -9,19 +9,32 @@ pub enum Input {
     /// `/me action`
     Me(String),
     /// `/msg target text`
-    Msg { target: String, text: String },
+    Msg {
+        target: String,
+        text: String,
+    },
     /// `/join channels [keys]`, sent as `JOIN <args>`.
     Join(String),
     /// `/part [#channel] [reason]`; no channel means the current tab's.
-    Part { channel: Option<String>, reason: Option<String> },
+    Part {
+        channel: Option<String>,
+        reason: Option<String>,
+    },
     /// `/query nick [text]`
-    Query { nick: String, text: Option<String> },
+    Query {
+        nick: String,
+        text: Option<String>,
+    },
     /// `/nick newnick`
     Nick(String),
     /// `/quit [reason]`
     Quit(Option<String>),
     /// `/close`: part (for a channel) and remove the tab.
     Close,
+    History {
+        count: usize,
+    },
+    MarkRead,
     /// `/raw line`, `/quote line`, or any other `/command args`.
     Raw(String),
     /// The command was recognised but used wrongly; the text says how to use it.
@@ -45,9 +58,10 @@ pub fn parse_input(line: &str) -> Option<Input> {
     let input = match command.to_ascii_lowercase().as_str() {
         "me" => Input::Me(rest.to_string()),
         "msg" => match split_word(rest) {
-            (target, text) if !target.is_empty() && !text.is_empty() => {
-                Input::Msg { target: target.to_string(), text: text.to_string() }
-            }
+            (target, text) if !target.is_empty() && !text.is_empty() => Input::Msg {
+                target: target.to_string(),
+                text: text.to_string(),
+            },
             _ => Input::Usage("Usage: /msg nick-or-channel message"),
         },
         "join" | "j" if rest.is_empty() => Input::Usage("Usage: /join #channel [key]"),
@@ -55,14 +69,23 @@ pub fn parse_input(line: &str) -> Option<Input> {
         "part" | "leave" => {
             let (first, after) = split_word(rest);
             if first.is_channel_name() {
-                Input::Part { channel: Some(first.to_string()), reason: non_empty(after) }
+                Input::Part {
+                    channel: Some(first.to_string()),
+                    reason: non_empty(after),
+                }
             } else {
-                Input::Part { channel: None, reason: non_empty(rest) }
+                Input::Part {
+                    channel: None,
+                    reason: non_empty(rest),
+                }
             }
         }
         "query" | "q" => match split_word(rest) {
             ("", _) => Input::Usage("Usage: /query nick [message]"),
-            (nick, text) => Input::Query { nick: nick.to_string(), text: non_empty(text) },
+            (nick, text) => Input::Query {
+                nick: nick.to_string(),
+                text: non_empty(text),
+            },
         },
         "nick" => match split_word(rest) {
             ("", _) => Input::Usage("Usage: /nick newnick"),
@@ -70,11 +93,34 @@ pub fn parse_input(line: &str) -> Option<Input> {
         },
         "quit" => Input::Quit(non_empty(rest)),
         "close" => Input::Close,
+        "history" => match if rest.is_empty() {
+            Ok(100)
+        } else {
+            rest.parse::<usize>()
+        } {
+            Ok(count @ 1..=1000) => Input::History { count },
+            _ => Input::Usage("Usage: /history [count from 1 to 1000]"),
+        },
+        "markread" if rest.is_empty() => Input::MarkRead,
+        "markread" => Input::Usage("Usage: /markread (explicitly mark displayed messages as read)"),
         "raw" | "quote" if rest.is_empty() => Input::Usage("Usage: /raw IRC command"),
         "raw" | "quote" => Input::Raw(rest.to_string()),
         _ => Input::Raw(command_line.trim().to_string()),
     };
     Some(input)
+}
+
+/// Local lifecycle and rejoin bookkeeping must recognize tags on raw commands.
+pub fn raw_intent(line: &str) -> Option<Input> {
+    let message = line.parse::<irc_proto::Message>().ok()?;
+    match message.command {
+        irc_proto::Command::QUIT(reason) => Some(Input::Quit(reason)),
+        irc_proto::Command::JOIN(channels, keys, _) => Some(Input::Join(match keys {
+            Some(keys) => format!("{channels} {keys}"),
+            None => channels,
+        })),
+        _ => None,
+    }
 }
 
 /// Splits off the first word; the rest keeps its inner spacing.
@@ -101,7 +147,10 @@ pub fn parse_join(args: &str) -> Vec<(String, Option<String>)> {
     channels
         .split(',')
         .map(|channel| {
-            let key = keys.next().filter(|k| !k.is_empty() && *k != "*").map(str::to_string);
+            let key = keys
+                .next()
+                .filter(|k| !k.is_empty() && *k != "*")
+                .map(str::to_string);
             (channel.to_string(), key)
         })
         .filter(|(channel, _)| channel.is_channel_name())
@@ -114,8 +163,13 @@ const MAX_JOIN_LINE: usize = 510;
 /// JOIN lines for these channels, each line at most 510 bytes. Channels with keys go first,
 /// since the server pairs keys with channels by position.
 pub fn join_lines(channels: &[(String, Option<String>)]) -> Vec<String> {
-    let keyed = channels.iter().filter_map(|(c, k)| k.as_deref().map(|k| (c.as_str(), Some(k))));
-    let unkeyed = channels.iter().filter(|(_, k)| k.is_none()).map(|(c, _)| (c.as_str(), None));
+    let keyed = channels
+        .iter()
+        .filter_map(|(c, k)| k.as_deref().map(|k| (c.as_str(), Some(k))));
+    let unkeyed = channels
+        .iter()
+        .filter(|(_, k)| k.is_none())
+        .map(|(c, _)| (c.as_str(), None));
     let mut lines = Vec::new();
     let (mut names, mut keys): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
     for (channel, key) in keyed.chain(unkeyed) {
@@ -148,6 +202,22 @@ fn join_line(names: &[&str], keys: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tagged_raw_commands_retain_disconnect_and_join_intent() {
+        assert_eq!(
+            super::raw_intent("@label=x QUIT :done"),
+            Some(super::Input::Quit(Some("done".into())))
+        );
+        assert_eq!(
+            super::raw_intent(":me QUIT"),
+            Some(super::Input::Quit(None))
+        );
+        assert_eq!(
+            super::raw_intent("@label=x JOIN #locked secret-key"),
+            Some(super::Input::Join("#locked secret-key".into()))
+        );
+        assert_eq!(super::raw_intent("PRIVMSG bob :QUIT"), None);
+    }
     use super::*;
 
     fn p(line: &str) -> Input {
@@ -169,8 +239,20 @@ mod tests {
     #[test]
     fn me_and_msg() {
         assert_eq!(p("/me waves  hello"), Input::Me("waves  hello".into()));
-        assert_eq!(p("/msg bob hi  there"), Input::Msg { target: "bob".into(), text: "hi  there".into() });
-        assert_eq!(p("/MSG #test hi"), Input::Msg { target: "#test".into(), text: "hi".into() });
+        assert_eq!(
+            p("/msg bob hi  there"),
+            Input::Msg {
+                target: "bob".into(),
+                text: "hi  there".into()
+            }
+        );
+        assert_eq!(
+            p("/MSG #test hi"),
+            Input::Msg {
+                target: "#test".into(),
+                text: "hi".into()
+            }
+        );
         assert!(matches!(p("/msg bob"), Input::Usage(_)));
     }
 
@@ -179,18 +261,45 @@ mod tests {
         assert_eq!(p("/join #a,#b key"), Input::Join("#a,#b key".into()));
         assert_eq!(p("/j #a"), Input::Join("#a".into()));
         assert!(matches!(p("/join"), Input::Usage(_)));
-        assert_eq!(p("/part"), Input::Part { channel: None, reason: None });
-        assert_eq!(p("/part bye all"), Input::Part { channel: None, reason: Some("bye all".into()) });
-        assert_eq!(p("/part #x see you"), Input::Part { channel: Some("#x".into()), reason: Some("see you".into()) });
+        assert_eq!(
+            p("/part"),
+            Input::Part {
+                channel: None,
+                reason: None
+            }
+        );
+        assert_eq!(
+            p("/part bye all"),
+            Input::Part {
+                channel: None,
+                reason: Some("bye all".into())
+            }
+        );
+        assert_eq!(
+            p("/part #x see you"),
+            Input::Part {
+                channel: Some("#x".into()),
+                reason: Some("see you".into())
+            }
+        );
     }
 
     #[test]
     fn join_args() {
         let k = |c: &str, k: Option<&str>| (c.to_string(), k.map(str::to_string));
         assert_eq!(parse_join("#a"), vec![k("#a", None)]);
-        assert_eq!(parse_join("#a,#b k1"), vec![k("#a", Some("k1")), k("#b", None)]);
-        assert_eq!(parse_join("#a,#b,#c *,k2"), vec![k("#a", None), k("#b", Some("k2")), k("#c", None)]);
-        assert_eq!(parse_join("#a,,#b k1,,k2"), vec![k("#a", Some("k1")), k("#b", Some("k2"))]);
+        assert_eq!(
+            parse_join("#a,#b k1"),
+            vec![k("#a", Some("k1")), k("#b", None)]
+        );
+        assert_eq!(
+            parse_join("#a,#b,#c *,k2"),
+            vec![k("#a", None), k("#b", Some("k2")), k("#c", None)]
+        );
+        assert_eq!(
+            parse_join("#a,,#b k1,,k2"),
+            vec![k("#a", Some("k1")), k("#b", Some("k2"))]
+        );
         assert_eq!(parse_join("0"), vec![]);
     }
 
@@ -198,17 +307,30 @@ mod tests {
     fn join_lines_put_keyed_channels_first() {
         let k = |c: &str, k: Option<&str>| (c.to_string(), k.map(str::to_string));
         assert_eq!(join_lines(&[]), Vec::<String>::new());
-        assert_eq!(join_lines(&[k("#a", None), k("#b", None)]), vec!["JOIN #a,#b"]);
         assert_eq!(
-            join_lines(&[k("#test", None), k("#secret", Some("k1")), k("#other", Some("k2"))]),
+            join_lines(&[k("#a", None), k("#b", None)]),
+            vec!["JOIN #a,#b"]
+        );
+        assert_eq!(
+            join_lines(&[
+                k("#test", None),
+                k("#secret", Some("k1")),
+                k("#other", Some("k2"))
+            ]),
             vec!["JOIN #secret,#other,#test k1,k2"]
         );
     }
 
     #[test]
     fn join_lines_split_at_the_limit() {
-        let channels: Vec<(String, Option<String>)> =
-            (0..100).map(|n| (format!("#channel{n:03}"), (n % 3 == 0).then(|| format!("key{n:03}")))).collect();
+        let channels: Vec<(String, Option<String>)> = (0..100)
+            .map(|n| {
+                (
+                    format!("#channel{n:03}"),
+                    (n % 3 == 0).then(|| format!("key{n:03}")),
+                )
+            })
+            .collect();
         let lines = join_lines(&channels);
         assert!(lines.len() > 1);
         let mut seen = Vec::new();
@@ -225,20 +347,58 @@ mod tests {
 
     #[test]
     fn query_nick_quit_close() {
-        assert_eq!(p("/query bob"), Input::Query { nick: "bob".into(), text: None });
-        assert_eq!(p("/q bob hi"), Input::Query { nick: "bob".into(), text: Some("hi".into()) });
+        assert_eq!(
+            p("/query bob"),
+            Input::Query {
+                nick: "bob".into(),
+                text: None
+            }
+        );
+        assert_eq!(
+            p("/q bob hi"),
+            Input::Query {
+                nick: "bob".into(),
+                text: Some("hi".into())
+            }
+        );
         assert!(matches!(p("/query"), Input::Usage(_)));
         assert_eq!(p("/nick newme"), Input::Nick("newme".into()));
         assert_eq!(p("/quit"), Input::Quit(None));
-        assert_eq!(p("/quit gone fishing"), Input::Quit(Some("gone fishing".into())));
+        assert_eq!(
+            p("/quit gone fishing"),
+            Input::Quit(Some("gone fishing".into()))
+        );
         assert_eq!(p("/close"), Input::Close);
     }
 
     #[test]
     fn raw_and_unknown() {
-        assert_eq!(p("/raw PRIVMSG #a :hi"), Input::Raw("PRIVMSG #a :hi".into()));
+        assert_eq!(
+            p("/raw PRIVMSG #a :hi"),
+            Input::Raw("PRIVMSG #a :hi".into())
+        );
         assert_eq!(p("/quote MODE #a"), Input::Raw("MODE #a".into()));
         assert_eq!(p("/whois bob"), Input::Raw("whois bob".into()));
         assert!(matches!(p("/raw"), Input::Usage(_)));
+    }
+}
+
+#[cfg(test)]
+mod ircv3_tests {
+    use super::*;
+    #[test]
+    fn history_and_marker_commands_validate_arguments() {
+        assert_eq!(parse_input("/history"), Some(Input::History { count: 100 }));
+        for args in ["0", "1001", "wrong", "10 extra"] {
+            assert!(matches!(
+                parse_input(&format!("/history {args}")),
+                Some(Input::Usage(_))
+            ));
+        }
+        assert_eq!(parse_input("/markread"), Some(Input::MarkRead));
+        assert!(matches!(
+            parse_input("/markread extra"),
+            Some(Input::Usage(_))
+        ));
     }
 }

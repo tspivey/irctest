@@ -14,6 +14,19 @@ pub const LOG_DIR: &str = "logs";
 /// The folder name for the server tab's log.
 pub const SERVER_TARGET: &str = "server";
 
+/// Stable log namespace for an account and an opaque bouncer network ID.
+/// Length prefixes prevent component-boundary collisions; the digest keeps
+/// account details and filesystem-unsafe network IDs out of directory names.
+pub fn child_namespace(account_identity: &str, network_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for component in [account_identity, network_id] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    format!("soju-{:x}", digest.finalize())
+}
+
 /// Makes a name safe as a Windows file or folder name. Characters Windows doesn't allow and
 /// trailing dots and spaces become `_`; device names like `NUL` or `con.foo` get a `_` added.
 pub fn sanitize(name: &str) -> String {
@@ -40,12 +53,19 @@ pub fn sanitize(name: &str) -> String {
 
 /// Windows device names, which are reserved with any extension and in any case.
 fn is_reserved(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
     match stem.as_str() {
         "CON" | "PRN" | "AUX" | "NUL" => true,
         _ => {
             let (prefix, digit) = stem.split_at(stem.len().min(3));
-            (prefix == "COM" || prefix == "LPT") && digit.len() == 1 && matches!(digit.as_bytes()[0], b'1'..=b'9')
+            (prefix == "COM" || prefix == "LPT")
+                && digit.len() == 1
+                && matches!(digit.as_bytes()[0], b'1'..=b'9')
         }
     }
 }
@@ -76,11 +96,20 @@ impl Default for Logger {
 
 impl Logger {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), files: HashMap::new() }
+        Self {
+            dir: dir.into(),
+            files: HashMap::new(),
+        }
     }
 
     /// Appends `[HH:MM:SS] text` to the target's log for `time`'s date, without formatting codes.
-    pub fn write(&mut self, server: &str, target: &str, time: DateTime<Local>, text: &str) -> io::Result<()> {
+    pub fn write(
+        &mut self,
+        server: &str,
+        target: &str,
+        time: DateTime<Local>,
+        text: &str,
+    ) -> io::Result<()> {
         let key = self.key(server, target);
         let date = time.date_naive();
         if !matches!(self.files.get(&key), Some((open_date, _)) if *open_date == date) {
@@ -110,7 +139,9 @@ impl Logger {
     }
 
     fn key(&self, server: &str, target: &str) -> String {
-        log_folder(&self.dir, server, target).to_string_lossy().to_lowercase()
+        log_folder(&self.dir, server, target)
+            .to_string_lossy()
+            .to_lowercase()
     }
 }
 
@@ -119,6 +150,22 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[test]
+    fn child_namespaces_are_stable_and_do_not_collapse_components() {
+        let account = "account/one:private-ish";
+        let namespace = child_namespace(account, "network/id");
+        assert_eq!(namespace, child_namespace(account, "network/id"));
+        assert_eq!(sanitize(&namespace), namespace);
+        assert_eq!(namespace.len(), "soju-".len() + 64);
+        assert!(!namespace.contains(account));
+        assert_ne!(namespace, child_namespace("other", "network/id"));
+        assert_ne!(namespace, child_namespace(account, "network_id"));
+        assert_ne!(child_namespace("ab", "c"), child_namespace("a", "bc"));
+        assert_ne!(
+            child_namespace("Account", "net"),
+            child_namespace("account", "net")
+        );
+    }
     #[test]
     fn sanitize_cases() {
         assert_eq!(sanitize("#test"), "#test");
@@ -154,11 +201,17 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
         assert_eq!(
             log_path(Path::new("logs"), "lan", "#test", date),
-            Path::new("logs").join("lan").join("#test").join("2026-10-13.log")
+            Path::new("logs")
+                .join("lan")
+                .join("#test")
+                .join("2026-10-13.log")
         );
         assert_eq!(
             log_path(Path::new("logs"), "my:net", "bob|away", date),
-            Path::new("logs").join("my_net").join("bob_away").join("2026-10-13.log")
+            Path::new("logs")
+                .join("my_net")
+                .join("bob_away")
+                .join("2026-10-13.log")
         );
     }
 
@@ -185,17 +238,31 @@ mod tests {
         let mut logger = Logger::new(&dir.0);
         let day1 = Local.with_ymd_and_hms(2026, 10, 13, 23, 59, 58).unwrap();
         let day2 = Local.with_ymd_and_hms(2026, 10, 14, 0, 0, 1).unwrap();
-        logger.write("lan", "#test", day1, "<bob> \x0304red\x03 \x02bold").unwrap();
-        logger.write("lan", "#Test", day1, "<tyler> same folder").unwrap();
-        logger.write("lan", "#test", day2, "<bob> next day").unwrap();
+        logger
+            .write("lan", "#test", day1, "<bob> \x0304red\x03 \x02bold")
+            .unwrap();
+        logger
+            .write("lan", "#Test", day1, "<tyler> same folder")
+            .unwrap();
+        logger
+            .write("lan", "#test", day2, "<bob> next day")
+            .unwrap();
         logger.close("lan", "#test");
-        logger.write("lan", "#test", day2, "<bob> reopened").unwrap();
+        logger
+            .write("lan", "#test", day2, "<bob> reopened")
+            .unwrap();
 
         let read = |date: (i32, u32, u32)| {
             let date = NaiveDate::from_ymd_opt(date.0, date.1, date.2).unwrap();
             std::fs::read_to_string(log_path(&dir.0, "lan", "#test", date)).unwrap()
         };
-        assert_eq!(read((2026, 10, 13)), "[23:59:58] <bob> red bold\n[23:59:58] <tyler> same folder\n");
-        assert_eq!(read((2026, 10, 14)), "[00:00:01] <bob> next day\n[00:00:01] <bob> reopened\n");
+        assert_eq!(
+            read((2026, 10, 13)),
+            "[23:59:58] <bob> red bold\n[23:59:58] <tyler> same folder\n"
+        );
+        assert_eq!(
+            read((2026, 10, 14)),
+            "[00:00:01] <bob> next day\n[00:00:01] <bob> reopened\n"
+        );
     }
 }

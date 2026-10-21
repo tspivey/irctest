@@ -1,7 +1,7 @@
 # IRCv3 and soju integration
 
 Date: 2026-10-20
-Status: Design approved in conversation; written specification awaiting review.
+Status: Implemented and automatically verified on 2026-10-21; live and native accessibility acceptance remains pending.
 
 ## Intent and acceptance
 

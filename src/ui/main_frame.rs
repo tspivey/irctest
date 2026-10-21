@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
 use irctest::config::Config;
-use irctest::net::{EventSink, NetEvent, ServerId};
+use irctest::net::{ConnectionEvent, EventSink, NetEvent, ServerId};
 use tokio::runtime::Handle;
 use wxdragon::prelude::*;
 
@@ -28,7 +28,7 @@ thread_local! {
 }
 
 /// Runs on the network threads: queue the event, then ask the GUI thread to drain the queue.
-fn make_sink(tx: mpsc::Sender<(ServerId, NetEvent)>) -> EventSink {
+fn make_sink(tx: mpsc::Sender<(ServerId, ConnectionEvent)>) -> EventSink {
     Arc::new(move |id, event| {
         if tx.send((id, event)).is_ok() {
             wxdragon::call_after(Box::new(|| {
@@ -54,7 +54,13 @@ pub struct MainFrame {
 }
 
 impl MainFrame {
-    pub fn new(config: Config, runtime: Handle) -> Self {
+    pub fn new(
+        config: Config,
+        runtime: Handle,
+        sync_data: irctest::sync_state::SyncData,
+        writer: irctest::sync_state::Writer,
+        sync_error: Option<String>,
+    ) -> Self {
         let frame = Frame::builder()
             .with_title("irctest")
             .with_size(Size::new(900, 650))
@@ -63,22 +69,46 @@ impl MainFrame {
 
         let (tx, rx) = mpsc::channel();
         let placeholder = add_placeholder_page(&notebook, &config);
-        let state = State::new(config, runtime, notebook, make_sink(tx), placeholder);
+        let state = State::new(
+            config,
+            runtime,
+            notebook,
+            make_sink(tx),
+            placeholder,
+            sync_data,
+            writer,
+            sync_error,
+        );
 
         let drain_state = state.clone();
         NET_HANDLER.with(|handler| {
             *handler.borrow_mut() = Some(Box::new(move || {
                 while let Ok((id, event)) = rx.try_recv() {
-                    match event {
+                    let attempt = event.attempt;
+                    if !drain_state.borrow().accepts_event(id, attempt) {
+                        if let NetEvent::UntrustedCertificate(p) = event.event {
+                            p.answer(false);
+                        }
+                        continue;
+                    }
+                    match event.event {
                         // State isn't borrowed while the dialog runs. Other events wait in the
                         // queue until it closes: this drain is still running.
                         NetEvent::UntrustedCertificate(prompt) => {
-                            let Some((name, saved)) = drain_state.borrow_mut().certificate_prompt(id, &prompt) else {
+                            let Some((name, saved)) =
+                                drain_state.borrow_mut().certificate_prompt(id, &prompt)
+                            else {
                                 prompt.answer(false);
                                 continue;
                             };
                             let choice = ask_certificate(&frame, &name, &saved, &prompt);
-                            drain_state.borrow_mut().certificate_answered(id, prompt, choice);
+                            if drain_state.borrow().accepts_event(id, attempt) {
+                                drain_state
+                                    .borrow_mut()
+                                    .certificate_answered(id, prompt, choice);
+                            } else {
+                                prompt.answer(false);
+                            }
                         }
                         event => drain_state.borrow_mut().handle_net_event(id, event),
                     }
@@ -86,6 +116,16 @@ impl MainFrame {
             }));
         });
 
+        let close_state = state.clone();
+        frame.on_close(move |event| {
+            close_state.borrow_mut().shutdown();
+            event.skip(true);
+        });
+        let destroy_state = state.clone();
+        frame.on_destroy(move |event| {
+            destroy_state.borrow_mut().shutdown();
+            event.skip(true);
+        });
         let main = Self { frame, state };
         main.build_menus();
         main.bind_menu_events();
@@ -104,19 +144,47 @@ impl MainFrame {
 
     fn build_menus(&self) {
         let server_menu = Menu::builder()
-            .append_item(ID_MANAGE_SERVERS, "&Manage servers...\tCtrl+Shift+S", "Add, edit, delete and connect to servers")
-            .append_item(ID_DISCONNECT, "&Disconnect", "Disconnect from the current tab's server")
-            .append_item(ID_RECONNECT, "&Reconnect", "Reconnect to the current tab's server now")
-            .append_item(ID_SETTINGS, "Se&ttings...", "Global nickname and other settings")
+            .append_item(
+                ID_MANAGE_SERVERS,
+                "&Manage servers...\tCtrl+Shift+S",
+                "Add, edit, delete and connect to servers",
+            )
+            .append_item(
+                ID_DISCONNECT,
+                "&Disconnect",
+                "Disconnect from the current tab's server",
+            )
+            .append_item(
+                ID_RECONNECT,
+                "&Reconnect",
+                "Reconnect to the current tab's server now",
+            )
+            .append_item(
+                ID_SETTINGS,
+                "Se&ttings...",
+                "Global nickname and other settings",
+            )
             .append_separator()
             .append_item(ID_EXIT, "E&xit\tAlt+F4", "Quit irctest")
             .build();
 
         let view_menu = Menu::builder()
-            .append_item(ID_TOGGLE_SPEECH, "Toggle &speech for this tab\tF5", "Turn speech on or off for the current tab")
-            .append_item(ID_TOGGLE_ALL_SPEECH, "Toggle &all speech\tShift+F5", "Turn all speech on or off")
+            .append_item(
+                ID_TOGGLE_SPEECH,
+                "Toggle &speech for this tab\tF5",
+                "Turn speech on or off for the current tab",
+            )
+            .append_item(
+                ID_TOGGLE_ALL_SPEECH,
+                "Toggle &all speech\tShift+F5",
+                "Turn all speech on or off",
+            )
             .append_separator()
-            .append_item(ID_CLOSE_TAB, "&Close tab\tCtrl+F4", "Leave the channel or close the private messages")
+            .append_item(
+                ID_CLOSE_TAB,
+                "&Close tab\tCtrl+F4",
+                "Leave the channel or close the private messages",
+            )
             .build();
 
         let help_menu = Menu::builder()
@@ -135,60 +203,73 @@ impl MainFrame {
     fn bind_menu_events(&self) {
         let frame = self.frame;
         let state = self.state.clone();
-        self.frame.on_menu_selected(move |event: MenuEventData| match event.get_id() {
-            // State is never borrowed while a dialog runs: network events are handled during
-            // the dialog's event loop and need to borrow it.
-            ID_MANAGE_SERVERS => {
-                let config = state.borrow().config().clone();
-                let saved = config.clone();
-                let result = manage_servers(&frame, &config, move |servers| {
-                    let config = Config { servers: servers.to_vec(), ..saved.clone() };
-                    config.save().map_err(|e| e.to_string())
-                });
-                let config = Config { servers: result.servers, ..config };
-                let connect = result.connect.map(|i| config.servers[i].clone());
-                state.borrow_mut().set_config(config);
-                if let Some(server) = connect {
-                    state.borrow_mut().connect(server);
-                }
-            }
-            ID_SETTINGS => {
-                let config = state.borrow().config().clone();
-                let current = Settings {
-                    nickname: config.nickname.clone(),
-                    username: config.username.clone(),
-                    realname: config.realname.clone(),
-                    log: config.log,
-                };
-                if let Some(new) = edit_settings(&frame, &current) {
-                    let config = Config { nickname: new.nickname, username: new.username, realname: new.realname, log: new.log, ..config };
-                    if let Err(e) = config.save() {
-                        message(&frame, &format!("Couldn't save settings:\n\n{e}"));
-                    }
+        self.frame
+            .on_menu_selected(move |event: MenuEventData| match event.get_id() {
+                // State is never borrowed while a dialog runs: network events are handled during
+                // the dialog's event loop and need to borrow it.
+                ID_MANAGE_SERVERS => {
+                    let config = state.borrow().config().clone();
+                    let saved = config.clone();
+                    let result = manage_servers(&frame, &config, move |servers| {
+                        let config = Config {
+                            servers: servers.to_vec(),
+                            ..saved.clone()
+                        };
+                        config.save().map_err(|e| e.to_string())
+                    });
+                    let config = Config {
+                        servers: result.servers,
+                        ..config
+                    };
+                    let connect = result.connect.map(|i| config.servers[i].clone());
                     state.borrow_mut().set_config(config);
+                    if let Some(server) = connect {
+                        state.borrow_mut().connect(server);
+                    }
                 }
-            }
-            ID_RECONNECT => {
-                let result = state.borrow_mut().reconnect_current();
-                if let Err(e) = result {
-                    message(&frame, &e);
+                ID_SETTINGS => {
+                    let config = state.borrow().config().clone();
+                    let current = Settings {
+                        nickname: config.nickname.clone(),
+                        username: config.username.clone(),
+                        realname: config.realname.clone(),
+                        log: config.log,
+                    };
+                    if let Some(new) = edit_settings(&frame, &current) {
+                        let config = Config {
+                            nickname: new.nickname,
+                            username: new.username,
+                            realname: new.realname,
+                            log: new.log,
+                            ..config
+                        };
+                        if let Err(e) = config.save() {
+                            message(&frame, &format!("Couldn't save settings:\n\n{e}"));
+                        }
+                        state.borrow_mut().set_config(config);
+                    }
                 }
-            }
-            ID_CLOSE_TAB => state.borrow_mut().close_current(),
-            ID_DISCONNECT => {
-                let result = state.borrow_mut().disconnect_current();
-                if let Err(e) = result {
-                    message(&frame, &e);
+                ID_RECONNECT => {
+                    let result = state.borrow_mut().reconnect_current();
+                    if let Err(e) = result {
+                        message(&frame, &e);
+                    }
                 }
-            }
-            ID_EXIT => {
-                frame.close(true);
-            }
-            ID_ABOUT => message(&frame, "irctest: an accessible IRC client."),
-            ID_TOGGLE_SPEECH => state.borrow_mut().toggle_tab_speech(),
-            ID_TOGGLE_ALL_SPEECH => state.borrow_mut().toggle_all_speech(),
-            _ => event.skip(true),
-        });
+                ID_CLOSE_TAB => state.borrow_mut().close_current(),
+                ID_DISCONNECT => {
+                    let result = state.borrow_mut().disconnect_current();
+                    if let Err(e) = result {
+                        message(&frame, &e);
+                    }
+                }
+                ID_EXIT => {
+                    frame.close(true);
+                }
+                ID_ABOUT => message(&frame, "irctest: an accessible IRC client."),
+                ID_TOGGLE_SPEECH => state.borrow_mut().toggle_tab_speech(),
+                ID_TOGGLE_ALL_SPEECH => state.borrow_mut().toggle_all_speech(),
+                _ => event.skip(true),
+            });
     }
 }
 
@@ -203,8 +284,14 @@ fn add_placeholder_page(notebook: &Notebook, config: &Config) -> Panel {
         1 => "1 server".to_string(),
         n => format!("{n} servers"),
     };
-    let nick = if config.nickname.is_empty() { "not set" } else { &config.nickname };
-    output.set_value(&format!("Not connected. {servers} configured. Global nickname: {nick}."));
+    let nick = if config.nickname.is_empty() {
+        "not set"
+    } else {
+        &config.nickname
+    };
+    output.set_value(&format!(
+        "Not connected. {servers} configured. Global nickname: {nick}."
+    ));
 
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&output, 1, SizerFlag::Expand | SizerFlag::All, 4);

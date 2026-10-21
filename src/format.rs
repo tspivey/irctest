@@ -16,11 +16,41 @@ pub struct Formatted {
 
 impl Formatted {
     fn line(text: String) -> Self {
-        Self { text: strip_formatting(&text), speech: None }
+        Self {
+            text: strip_formatting(&text),
+            speech: None,
+        }
     }
 
     fn spoken(text: String, speech: String) -> Self {
-        Self { text: strip_formatting(&text), speech: Some(strip_formatting(&speech)) }
+        Self {
+            text: strip_formatting(&text),
+            speech: Some(strip_formatting(&speech)),
+        }
+    }
+}
+
+/// Safe local command feedback: credential payloads never enter output or logs.
+pub fn command_feedback(line: &str) -> String {
+    let Ok(message) = line.parse::<Message>() else {
+        return "Invalid IRC command.".into();
+    };
+    let sensitive = match &message.command {
+        Command::PASS(_) => Some("PASS"),
+        Command::AUTHENTICATE(_) => Some("AUTHENTICATE"),
+        Command::Raw(cmd, _)
+            if ["PASS", "AUTHENTICATE", "BOUNCER"]
+                .iter()
+                .any(|c| cmd.eq_ignore_ascii_case(c)) =>
+        {
+            Some(cmd.as_str())
+        }
+        _ => None,
+    };
+    match sensitive {
+        Some(cmd) if cmd.eq_ignore_ascii_case("BOUNCER") => "BOUNCER [attributes omitted]".into(),
+        Some(cmd) => format!("{} [redacted]", cmd.to_ascii_uppercase()),
+        None => line.trim().to_owned(),
     }
 }
 
@@ -39,7 +69,9 @@ pub fn format_message(msg: &Message) -> Option<Formatted> {
                 };
                 Formatted::spoken(format!("* {nick} {action}"), speech)
             }
-            Some((ctcp, args)) => Formatted::line(join_nonempty(&format!("CTCP {ctcp} from {source}"), args)),
+            Some((ctcp, args)) => {
+                Formatted::line(join_nonempty(&format!("CTCP {ctcp} from {source}"), args))
+            }
             None => {
                 let speech = if target.is_channel_name() {
                     format!("{nick} on {} says {text}", spoken_channel(target))
@@ -50,36 +82,76 @@ pub fn format_message(msg: &Message) -> Option<Formatted> {
             }
         },
         Command::NOTICE(_, text) => match parse_ctcp(text) {
-            Some((ctcp, args)) => Formatted::line(join_nonempty(&format!("CTCP {ctcp} reply from {source}:"), args)),
+            Some((ctcp, args)) => Formatted::line(join_nonempty(
+                &format!("CTCP {ctcp} reply from {source}:"),
+                args,
+            )),
             None => Formatted::line(format!("-{source}- {text}")),
         },
         Command::JOIN(channel, _, _) => Formatted::line(format!("{nick} has joined {channel}")),
-        Command::PART(channel, reason) => {
-            Formatted::line(with_reason(format!("{nick} has left {channel}"), reason.as_deref()))
+        Command::PART(channel, reason) => Formatted::line(with_reason(
+            format!("{nick} has left {channel}"),
+            reason.as_deref(),
+        )),
+        Command::QUIT(reason) => {
+            Formatted::line(with_reason(format!("{nick} has quit"), reason.as_deref()))
         }
-        Command::QUIT(reason) => Formatted::line(with_reason(format!("{nick} has quit"), reason.as_deref())),
         Command::NICK(new) => Formatted::line(format!("{nick} is now known as {new}")),
         Command::TOPIC(channel, Some(topic)) if topic.is_empty() => {
             Formatted::line(format!("{source} cleared the topic of {channel}"))
         }
-        Command::TOPIC(channel, Some(topic)) => {
-            Formatted::line(format!("{source} changed the topic of {channel} to: {topic}"))
-        }
+        Command::TOPIC(channel, Some(topic)) => Formatted::line(format!(
+            "{source} changed the topic of {channel} to: {topic}"
+        )),
         Command::KICK(channel, victim, reason) => Formatted::line(with_reason(
             format!("{source} has kicked {victim} from {channel}"),
             reason.as_deref(),
         )),
         Command::ChannelMODE(channel, modes) => {
             let modes: Vec<String> = modes.iter().map(|m| m.to_string()).collect();
-            Formatted::line(format!("{source} sets mode {} on {channel}", modes.join(" ")))
+            Formatted::line(format!(
+                "{source} sets mode {} on {channel}",
+                modes.join(" ")
+            ))
         }
         Command::UserMODE(target, modes) => {
             let modes: Vec<String> = modes.iter().map(|m| m.to_string()).collect();
-            Formatted::line(format!("{source} sets mode {} on {target}", modes.join(" ")))
+            Formatted::line(format!(
+                "{source} sets mode {} on {target}",
+                modes.join(" ")
+            ))
         }
-        Command::INVITE(_, channel) => Formatted::line(format!("{source} invites you to {channel}")),
+        Command::INVITE(_, channel) => {
+            Formatted::line(format!("{source} invites you to {channel}"))
+        }
         Command::ERROR(text) => Formatted::line(format!("Error: {text}")),
-        Command::PING(..) | Command::PONG(..) | Command::CAP(..) | Command::AUTHENTICATE(_) => return None,
+        Command::BATCH(..)
+        | Command::PING(..)
+        | Command::PONG(..)
+        | Command::CAP(..)
+        | Command::AUTHENTICATE(_) => return None,
+        Command::Raw(cmd, _)
+            if ["TAGMSG", "BOUNCER", "MARKREAD", "CHATHISTORY"]
+                .iter()
+                .any(|c| cmd.eq_ignore_ascii_case(c)) =>
+        {
+            return None;
+        }
+        Command::Raw(cmd, args)
+            if ["FAIL", "WARN", "NOTE"]
+                .iter()
+                .any(|c| cmd.eq_ignore_ascii_case(c)) =>
+        {
+            if args.first().is_some_and(|a| {
+                a.eq_ignore_ascii_case("BOUNCER") || a.eq_ignore_ascii_case("AUTHENTICATE")
+            }) {
+                Formatted::line(format!(
+                    "{cmd}: bouncer operation failed (details omitted)."
+                ))
+            } else {
+                Formatted::line(format!("{cmd}: {}", args.join(" ")))
+            }
+        }
         // Empty or prefix-only lines parse as an empty raw command.
         Command::Raw(cmd, _) if cmd.is_empty() => return None,
         // Numerics: the first parameter is our own nick, so leave it out.
@@ -89,7 +161,11 @@ pub fn format_message(msg: &Message) -> Option<Formatted> {
         Command::Response(Response::RPL_ENDOFNAMES, _) => return None,
         // `<nick> <channel> <users> :<topic>`
         Command::Response(Response::RPL_LIST, args) if args.len() >= 3 => {
-            let users = if args[2] == "1" { "1 user".to_string() } else { format!("{} users", args[2]) };
+            let users = if args[2] == "1" {
+                "1 user".to_string()
+            } else {
+                format!("{} users", args[2])
+            };
             let topic = args.get(3).map(|t| t.trim()).filter(|t| !t.is_empty());
             Formatted::line(match topic {
                 Some(topic) => format!("{} ({users}): {topic}", args[1]),
@@ -113,16 +189,24 @@ pub fn format_message(msg: &Message) -> Option<Formatted> {
             Formatted::line(format!("Topic for {} set by {setter}{when}", args[1]))
         }
         // `<nick> <mask> [<account>] :You are now logged in as ...`: the text says it all.
-        Command::Response(Response::RPL_LOGGEDIN | Response::RPL_LOGGEDOUT, args) if !args.is_empty() => {
+        Command::Response(Response::RPL_LOGGEDIN | Response::RPL_LOGGEDOUT, args)
+            if !args.is_empty() =>
+        {
             Formatted::line(args[args.len() - 1].clone())
         }
-        Command::Response(_, args) => Formatted::line(args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ")),
+        Command::Response(_, args) => {
+            Formatted::line(args.iter().skip(1).cloned().collect::<Vec<_>>().join(" "))
+        }
         Command::Raw(cmd, args) if is_numeric(cmd) => {
             Formatted::line(args.iter().skip(1).cloned().collect::<Vec<_>>().join(" "))
         }
         // Anything else: show the raw line without tags.
         _ => {
-            let bare = Message { tags: None, prefix: msg.prefix.clone(), command: msg.command.clone() };
+            let bare = Message {
+                tags: None,
+                prefix: msg.prefix.clone(),
+                command: msg.command.clone(),
+            };
             Formatted::line(bare.to_string().trim_end().to_string())
         }
     };
@@ -150,6 +234,11 @@ pub fn message_time(msg: &Message) -> Option<DateTime<Local>> {
 }
 
 /// `"[HH:MM] text"`, in local time.
+/// History includes the source date so messages from older days remain distinct.
+pub fn history_timestamped(time: DateTime<Local>, text: &str) -> String {
+    format!("[{}] {text}", time.format("%Y-%m-%d %H:%M"))
+}
+
 pub fn timestamped(time: DateTime<Local>, text: &str) -> String {
     format!("[{}] {text}", time.format("%H:%M"))
 }
@@ -194,7 +283,11 @@ fn with_reason(text: String, reason: Option<&str>) -> String {
 }
 
 fn join_nonempty(head: &str, tail: &str) -> String {
-    if tail.is_empty() { head.to_string() } else { format!("{head} {tail}") }
+    if tail.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head} {tail}")
+    }
 }
 
 /// Removes mIRC formatting: bold, italics, underline, strikethrough, monospace, reverse,
@@ -218,7 +311,11 @@ pub fn strip_formatting(text: &str) -> String {
 
 /// Skips `fg[,bg]` after a colour code, each being up to `max` chars matching `is_digit`.
 /// A comma is only consumed when a background colour follows it.
-fn skip_colour(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize, is_digit: fn(char) -> bool) {
+fn skip_colour(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    max: usize,
+    is_digit: fn(char) -> bool,
+) {
     if skip_digits(chars, max, is_digit) == 0 {
         return;
     }
@@ -229,7 +326,11 @@ fn skip_colour(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize,
     }
 }
 
-fn skip_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize, is_digit: fn(char) -> bool) -> usize {
+fn skip_digits(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    max: usize,
+    is_digit: fn(char) -> bool,
+) -> usize {
     let mut n = 0;
     while n < max && chars.peek().copied().is_some_and(is_digit) {
         chars.next();
@@ -240,6 +341,42 @@ fn skip_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn history_lines_include_the_source_date() {
+        let time = chrono::Local
+            .with_ymd_and_hms(2026, 10, 20, 10, 15, 0)
+            .unwrap();
+        assert_eq!(
+            super::history_timestamped(time, "<bob> older message"),
+            "[2026-10-20 10:15] <bob> older message"
+        );
+    }
+    #[test]
+    fn tagged_and_prefixed_credential_commands_are_redacted() {
+        for line in [
+            "@label=x BOUNCER CHANGENETWORK 42 pass=secret",
+            "@label=x AUTHENTICATE secret",
+            ":me PASS secret",
+            "@label=x :me BOUNCER ADDNETWORK pass=secret",
+        ] {
+            assert!(
+                !super::command_feedback(line).contains("secret"),
+                "credential command exposed"
+            );
+        }
+    }
+    #[test]
+    fn outgoing_credentials_have_safe_feedback() {
+        for line in [
+            "PASS supersecret",
+            "AUTHENTICATE secretpayload",
+            "BOUNCER ADDNETWORK host=x;pass=supersecret",
+            "BOUNCER CHANGENETWORK 42 pass=supersecret",
+        ] {
+            assert!(!super::command_feedback(line).contains("secret"));
+        }
+        assert_eq!(super::command_feedback("WHOIS bob"), "WHOIS bob");
+    }
     use super::*;
 
     fn fmt(line: &str) -> Option<Formatted> {
@@ -267,7 +404,10 @@ mod tests {
             text(":irc.test 900 tyler tyler!t@host tyler :You are now logged in as tyler\r\n"),
             "You are now logged in as tyler"
         );
-        assert_eq!(text(":irc.test 903 tyler :SASL authentication successful\r\n"), "SASL authentication successful");
+        assert_eq!(
+            text(":irc.test 903 tyler :SASL authentication successful\r\n"),
+            "SASL authentication successful"
+        );
         assert!(fmt("AUTHENTICATE +\r\n").is_none());
         assert!(fmt(":irc.test CAP * LS :sasl\r\n").is_none());
     }
@@ -320,7 +460,10 @@ mod tests {
         let f = fmt(":bob!b@host NOTICE #test :hi all\r\n").unwrap();
         assert_eq!(f.text, "-bob- hi all");
         assert_eq!(f.speech, None);
-        assert_eq!(text(":irc.example.net NOTICE * :*** Looking up your hostname\r\n"), "-irc.example.net- *** Looking up your hostname");
+        assert_eq!(
+            text(":irc.example.net NOTICE * :*** Looking up your hostname\r\n"),
+            "-irc.example.net- *** Looking up your hostname"
+        );
         assert_eq!(text("NOTICE AUTH :hello\r\n"), "-*- hello");
     }
 
@@ -334,7 +477,10 @@ mod tests {
     #[test]
     fn strip_formatting_cases() {
         assert_eq!(strip_formatting("plain"), "plain");
-        assert_eq!(strip_formatting("\x1ditalic\x1d \x1estrike\x1e \x11mono\x11 \x16rev\x0f"), "italic strike mono rev");
+        assert_eq!(
+            strip_formatting("\x1ditalic\x1d \x1estrike\x1e \x11mono\x11 \x16rev\x0f"),
+            "italic strike mono rev"
+        );
         assert_eq!(strip_formatting("\x0304,05text"), "text");
         assert_eq!(strip_formatting("\x0399text"), "text");
         assert_eq!(strip_formatting("\x034,text"), ",text"); // comma without background is text
@@ -348,19 +494,43 @@ mod tests {
     fn membership_events() {
         assert_eq!(text(":bob!b@host JOIN #test\r\n"), "bob has joined #test");
         assert_eq!(text(":bob!b@host JOIN :#test\r\n"), "bob has joined #test");
-        assert_eq!(text(":bob!b@host PART #test :bye\r\n"), "bob has left #test (bye)");
+        assert_eq!(
+            text(":bob!b@host PART #test :bye\r\n"),
+            "bob has left #test (bye)"
+        );
         assert_eq!(text(":bob!b@host PART #test\r\n"), "bob has left #test");
-        assert_eq!(text(":bob!b@host QUIT :Ping timeout\r\n"), "bob has quit (Ping timeout)");
-        assert_eq!(text(":bob!b@host NICK bobby\r\n"), "bob is now known as bobby");
-        assert_eq!(text(":op!o@host KICK #test bob :spam\r\n"), "op has kicked bob from #test (spam)");
+        assert_eq!(
+            text(":bob!b@host QUIT :Ping timeout\r\n"),
+            "bob has quit (Ping timeout)"
+        );
+        assert_eq!(
+            text(":bob!b@host NICK bobby\r\n"),
+            "bob is now known as bobby"
+        );
+        assert_eq!(
+            text(":op!o@host KICK #test bob :spam\r\n"),
+            "op has kicked bob from #test (spam)"
+        );
     }
 
     #[test]
     fn topic_and_modes() {
-        assert_eq!(text(":bob!b@host TOPIC #test :new topic\r\n"), "bob changed the topic of #test to: new topic");
-        assert_eq!(text(":bob!b@host TOPIC #test :\r\n"), "bob cleared the topic of #test");
-        assert_eq!(text(":op!o@host MODE #test +o bob\r\n"), "op sets mode +o bob on #test");
-        assert_eq!(text(":tyler MODE tyler :+i\r\n"), "tyler sets mode +i on tyler");
+        assert_eq!(
+            text(":bob!b@host TOPIC #test :new topic\r\n"),
+            "bob changed the topic of #test to: new topic"
+        );
+        assert_eq!(
+            text(":bob!b@host TOPIC #test :\r\n"),
+            "bob cleared the topic of #test"
+        );
+        assert_eq!(
+            text(":op!o@host MODE #test +o bob\r\n"),
+            "op sets mode +o bob on #test"
+        );
+        assert_eq!(
+            text(":tyler MODE tyler :+i\r\n"),
+            "tyler sets mode +i on tyler"
+        );
     }
 
     #[test]
@@ -369,14 +539,23 @@ mod tests {
             text(":irc.example.net 001 tyler :Welcome to the network tyler\r\n"),
             "Welcome to the network tyler"
         );
-        assert_eq!(text(":irc.example.net 372 tyler :- MOTD line\r\n"), "- MOTD line");
-        assert_eq!(text(":irc.example.net 999 tyler some :thing\r\n"), "some thing");
+        assert_eq!(
+            text(":irc.example.net 372 tyler :- MOTD line\r\n"),
+            "- MOTD line"
+        );
+        assert_eq!(
+            text(":irc.example.net 999 tyler some :thing\r\n"),
+            "some thing"
+        );
     }
 
     #[test]
     fn error_and_unknown() {
         assert_eq!(text("ERROR :Closing link\r\n"), "Error: Closing link");
-        assert_eq!(text(":bob!b@host WALLOPS :hi opers\r\n"), ":bob!b@host WALLOPS :hi opers");
+        assert_eq!(
+            text(":bob!b@host WALLOPS :hi opers\r\n"),
+            ":bob!b@host WALLOPS :hi opers"
+        );
     }
 
     #[test]
@@ -387,28 +566,56 @@ mod tests {
 
     #[test]
     fn topic_and_names_numerics() {
-        assert_eq!(text(":srv 332 tyler #test :the topic\r\n"), "Topic for #test: the topic");
-        assert_eq!(text(":srv 331 tyler #test :No topic is set\r\n"), "No topic is set for #test");
-        assert_eq!(text(":srv 333 tyler #test bob!b@h\r\n"), "Topic for #test set by bob");
-        assert!(text(":srv 333 tyler #test bob 1760356800\r\n").starts_with("Topic for #test set by bob on 20"));
-        assert_eq!(text(":srv 353 tyler = #test :tyler @bob\r\n"), "Users on #test: tyler @bob");
+        assert_eq!(
+            text(":srv 332 tyler #test :the topic\r\n"),
+            "Topic for #test: the topic"
+        );
+        assert_eq!(
+            text(":srv 331 tyler #test :No topic is set\r\n"),
+            "No topic is set for #test"
+        );
+        assert_eq!(
+            text(":srv 333 tyler #test bob!b@h\r\n"),
+            "Topic for #test set by bob"
+        );
+        assert!(
+            text(":srv 333 tyler #test bob 1760356800\r\n")
+                .starts_with("Topic for #test set by bob on 20")
+        );
+        assert_eq!(
+            text(":srv 353 tyler = #test :tyler @bob\r\n"),
+            "Users on #test: tyler @bob"
+        );
         assert_eq!(fmt(":srv 366 tyler #test :End of NAMES list\r\n"), None);
     }
 
     #[test]
     fn list_numerics() {
         assert_eq!(text(":srv 322 tyler #test 1 :\r\n"), "#test (1 user)");
-        assert_eq!(text(":srv 322 tyler #rust 12 :[+nt] Rust talk\r\n"), "#rust (12 users): [+nt] Rust talk");
+        assert_eq!(
+            text(":srv 322 tyler #rust 12 :[+nt] Rust talk\r\n"),
+            "#rust (12 users): [+nt] Rust talk"
+        );
         assert_eq!(text(":srv 323 tyler :End of LIST\r\n"), "End of LIST");
     }
 
     #[test]
     fn server_time_tag() {
-        let msg: Message = "@time=2026-10-13T12:34:56.000Z :bob!b@h PRIVMSG #test :hi\r\n".parse().unwrap();
-        let expected = DateTime::parse_from_rfc3339("2026-10-13T12:34:56Z").unwrap().with_timezone(&Local);
+        let msg: Message = "@time=2026-10-13T12:34:56.000Z :bob!b@h PRIVMSG #test :hi\r\n"
+            .parse()
+            .unwrap();
+        let expected = DateTime::parse_from_rfc3339("2026-10-13T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Local);
         assert_eq!(message_time(&msg), Some(expected));
-        assert_eq!(message_time(&":bob!b@h PRIVMSG #test :hi\r\n".parse().unwrap()), None);
-        assert_eq!(timestamped(expected, "x"), format!("[{}] x", expected.format("%H:%M")));
+        assert_eq!(
+            message_time(&":bob!b@h PRIVMSG #test :hi\r\n".parse().unwrap()),
+            None
+        );
+        assert_eq!(
+            timestamped(expected, "x"),
+            format!("[{}] x", expected.format("%H:%M"))
+        );
     }
 
     #[test]

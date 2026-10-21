@@ -2,3 +2,6 @@
 /irctest.toml
 /irctest.toml.tmp
 /logs
+
+/irctest-state.toml
+/irctest-state.toml.tmp

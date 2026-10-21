@@ -46,6 +46,7 @@ pub struct ServerConfig {
     /// Blank = use the global nickname.
     pub nickname: String,
     pub auto_connect: bool,
+    pub discover_networks: bool,
     /// Raw IRC lines sent after registration (001).
     pub connect_commands: Vec<String>,
     /// SHA-256 fingerprint of a TLS certificate to accept even though Windows doesn't trust it
@@ -67,6 +68,7 @@ impl Default for ServerConfig {
             password: String::new(),
             nickname: String::new(),
             auto_connect: false,
+            discover_networks: true,
             connect_commands: Vec::new(),
             fingerprint: String::new(),
             sasl_username: String::new(),
@@ -127,17 +129,29 @@ impl Config {
     /// Empty if neither is set.
     pub fn effective_nick<'a>(&'a self, server: &'a ServerConfig) -> &'a str {
         let nick = server.nickname.trim();
-        if nick.is_empty() { self.nickname.trim() } else { nick }
+        if nick.is_empty() {
+            self.nickname.trim()
+        } else {
+            nick
+        }
     }
 
     pub fn effective_username<'a>(&'a self, server: &'a ServerConfig) -> &'a str {
         let user = self.username.trim();
-        if user.is_empty() { self.effective_nick(server) } else { user }
+        if user.is_empty() {
+            self.effective_nick(server)
+        } else {
+            user
+        }
     }
 
     pub fn effective_realname<'a>(&'a self, server: &'a ServerConfig) -> &'a str {
         let real = self.realname.trim();
-        if real.is_empty() { self.effective_nick(server) } else { real }
+        if real.is_empty() {
+            self.effective_nick(server)
+        } else {
+            real
+        }
     }
 }
 
@@ -151,7 +165,8 @@ mod tests {
 
     impl TempFile {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("irctest-{}-{name}.toml", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("irctest-{}-{name}.toml", std::process::id()));
             let _ = std::fs::remove_file(&path);
             Self(path)
         }
@@ -177,6 +192,7 @@ mod tests {
                 password: "user/net:pass".into(),
                 nickname: String::new(),
                 auto_connect: true,
+                discover_networks: true,
                 connect_commands: vec!["JOIN #test".into(), "PRIVMSG NickServ :IDENTIFY x".into()],
                 fingerprint: "AB:CD".into(),
                 sasl_username: "account".into(),
@@ -191,6 +207,19 @@ mod tests {
         assert_eq!(Config::load_from(&file.0).unwrap(), Config::default());
     }
 
+    #[test]
+    fn discovery_defaults_on_and_can_be_disabled_in_old_compatible_config() {
+        let old: Config =
+            toml::from_str("nickname = 'me'\n[[servers]]\nhost = 'bouncer.test'\n").unwrap();
+        assert!(old.servers[0].discover_networks);
+        let disabled: Config = toml::from_str(
+            "nickname = 'me'\n[[servers]]\nhost = 'bouncer.test'\ndiscover_networks = false\n",
+        )
+        .unwrap();
+        assert!(!disabled.servers[0].discover_networks);
+        let serialized = toml::to_string(&disabled).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), disabled);
+    }
     #[test]
     fn round_trip() {
         let file = TempFile::new("roundtrip");
@@ -226,7 +255,10 @@ mod tests {
     fn invalid_file_is_an_error() {
         let file = TempFile::new("invalid");
         std::fs::write(&file.0, "nickname = [").unwrap();
-        assert!(matches!(Config::load_from(&file.0), Err(ConfigError::Parse(_))));
+        assert!(matches!(
+            Config::load_from(&file.0),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     #[test]

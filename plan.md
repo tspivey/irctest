@@ -47,13 +47,13 @@ src/
 ### What `net.rs` does
 
 - TLS: a normal handshake first. If it fails, a second connection with verification off; its certificate's SHA-256 fingerprint is checked against the saved and accepted ones, and otherwise the user is asked (`NetEvent::UntrustedCertificate`) before registering on that same connection (step 11).
-- Registration: `PASS` (when the password isn't empty), `NICK`, `USER`.
+- Registration: `CAP LS 302`, `PASS` (when configured), `NICK`, `USER`, followed by the negotiated CAP/SASL barrier. Discovered soju children authenticate and send BIND before CAP END.
 - Nick in use or invalid (`433`/`432`) before `001`: tries `nick_`, `nick__`, `nick___` in turn, then gives up with "Every nickname is in use." (no retry). After registration the user picks their own nick.
 - Tracks our nick: from `001`'s first parameter and from `NICK` messages whose source is us. `NickChanged` is sent after the message that caused it, so the GUI routes that message with the old nick.
 - Answers server `PING`s. PINGs the server every 180 s; if no line at all arrives within 20 s after that, the connection is dropped.
 - CTCP replies to `VERSION`, `PING`, `TIME`, `CLIENTINFO` (as `NOTICE`s to the sender, never to our own messages).
 - `connect_commands` are sent when `001` arrives.
-- Lines are read as bytes and decoded lossily, so invalid UTF-8 becomes `\u{FFFD}`; a line that fails to parse is reported as `NetEvent::Error` and the connection carries on. Lines over 16 KiB are cut. Outgoing messages are cut at any CR/LF so a message can't carry a second command.
+- Lines are read as bytes and decoded lossily, so invalid UTF-8 becomes `\u{FFFD}`; a line that fails to parse is reported as `NetEvent::Error` and the connection carries on. Physical lines over 16 KiB are discarded through the next newline so a remainder cannot become live traffic. Outgoing messages are cut at any CR/LF so a message can't carry a second command.
 - No outgoing flood throttling (the `irc` crate had settings for it but never applied them).
 
 ### What we still do ourselves
@@ -332,10 +332,29 @@ Each step ends with something runnable and tested against the LAN server (`10.0.
 
 ### Later
 - Nick list, tab completion of nicks.
-- Request `server-time` and suppress speech for ZNC playback buffer.
+- IRCv3 timestamps and quiet playback are implemented in the integration below; live screen-reader acceptance remains to be performed.
 
 ## Decisions
 
-1. **ZNC buffer playback:** deferred. Playback is spoken like any other message for now (see "Later").
+1. **ZNC buffer playback:** initially deferred; the IRCv3 integration now classifies playback batches as quiet history.
 2. **Queries:** speech starts on for new query tabs, same as channels.
 3. **Mentions:** messages mentioning your nick are spoken even when the tab's speech is off, but not when global speech is off. Notices get no special treatment.
+
+
+## IRCv3 and soju integration, 2026-10-20
+
+The follow-on [design](docs/superpowers/specs/2026-10-20-ircv3-soju-design.md)
+and [implementation plan](docs/superpowers/plans/2026-10-20-ircv3-soju.md)
+extend the existing client with general CAP negotiation, server echo handling,
+authenticated automatic soju network sessions, quiet history restoration,
+`/history`, explicit `/markread`, unread labels, and durable synchronization
+metadata. See [README.md](README.md) for configuration, exact capability coverage,
+commands, limits, and excluded extensions.
+
+Automated evidence covers in-memory protocol transcripts, local TLS fixtures,
+capability and connection state, history paging/deduplication, read markers,
+serialized persistence, and pure display/anchor policies. Live soju accounts,
+two-device synchronization, audible speech, keyboard/focus acceptance, and
+Windows native Unicode selection preservation have not been exercised for this
+change. The earlier step-by-step acceptance records above describe those earlier
+revisions, not live acceptance of this integration.
