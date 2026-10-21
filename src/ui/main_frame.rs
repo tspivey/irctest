@@ -346,6 +346,7 @@ fn add_placeholder_page(notebook: &Notebook, config: &Config) -> Panel {
     output.set_value(&format!(
         "Not connected. {servers} configured. Global nickname: {nick}."
     ));
+    output.set_insertion_point(output.get_last_position());
 
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&output, 1, SizerFlag::Expand | SizerFlag::All, 4);

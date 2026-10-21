@@ -1,3 +1,6 @@
+use std::cell::Cell;
+use std::rc::Rc;
+
 use irctest::playback::{TextPoint, ViewAnchor, history_edit};
 use wxdragon::prelude::*;
 
@@ -8,6 +11,7 @@ pub struct Tab {
     pub panel: Panel,
     pub output: TextCtrl,
     pub input: TextCtrl,
+    output_reviewed: Rc<Cell<bool>>,
 }
 
 impl Tab {
@@ -32,6 +36,12 @@ impl Tab {
             )
             .build();
         disable_beep(&output);
+        let output_reviewed = Rc::new(Cell::new(false));
+        let reviewed = output_reviewed.clone();
+        output.on_set_focus(move |event| {
+            reviewed.set(true);
+            event.skip(true);
+        });
 
         let sizer = BoxSizer::builder(Orientation::Vertical).build();
         sizer.add(
@@ -56,10 +66,11 @@ impl Tab {
             panel,
             output,
             input,
+            output_reviewed,
         }
     }
 
-    /// Adds a line at the end of the output without moving the cursor or selection.
+    /// Starts at the end until Output is first focused, then preserves reading position.
     /// Beyond `MAX_LINES`, the oldest lines are removed.
     pub fn append_line(&self, line: &str) -> usize {
         let (sel_from, sel_to) = self.output.get_selection();
@@ -77,9 +88,12 @@ impl Tab {
         let removed = self.trim_to_max_lines();
         let shift = |pos: i64| (pos - removed).max(0);
 
-        // append_text moves the cursor to the end; put it back.
+        // Keep new output at the bottom until the user starts reviewing it.
         if sel_from != sel_to {
             self.output.set_selection(shift(sel_from), shift(sel_to));
+        } else if !self.output_reviewed.get() {
+            self.output
+                .set_insertion_point(self.output.get_last_position());
         } else {
             self.output.set_insertion_point(shift(cursor));
         }
@@ -135,6 +149,8 @@ impl Tab {
                 |p: TextPoint| output.xy_to_position(p.column as i64, p.line as i64).max(0);
             if let Some((from, to)) = edit.anchor.selection {
                 output.set_selection(restore(from), restore(to));
+            } else if !self.output_reviewed.get() {
+                output.set_insertion_point(output.get_last_position());
             } else {
                 output.set_insertion_point(restore(edit.anchor.cursor));
             }

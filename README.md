@@ -26,9 +26,10 @@ Server tabs remain open; use Server, Disconnect or `/quit` to disconnect.
 F5 toggles speech for the current tab. Shift+F5 toggles all speech. New
 conversation tabs start with speech enabled. With global speech enabled,
 mentions can still be announced when that tab's speech is off. The client
-preserves the output cursor and selection when appending messages and adjusts
-them when inserting history or removing old lines. Each tab retains at most
-10,000 output lines.
+starts each output cursor at the bottom, including restored startup history.
+Once you focus Output to review it, the client preserves the cursor and selection
+when appending messages and adjusts them when inserting history or removing old
+lines. Each tab retains at most 10,000 output lines.
 
 ## Configuration
 
