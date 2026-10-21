@@ -1315,7 +1315,7 @@ impl State {
             return false;
         }
         let target = self.servers[s].tabs[t].name.clone();
-        let boundary = if reason == HistoryReason::Older {
+        let boundary = if reason != HistoryReason::CatchUp {
             self.servers[s].tabs[t]
                 .first_chat
                 .unwrap_or(self.line_count(s, t))
@@ -1391,7 +1391,7 @@ impl State {
         target: &str,
         reason: HistoryReason,
         messages: Vec<Message>,
-        pending: Option<bool>,
+        completion: Option<(bool, bool)>, // (pending, exhausted) for requested pages
         boundary: Option<usize>,
     ) {
         // Opening an unsolicited query may start its independent requested context;
@@ -1407,7 +1407,7 @@ impl State {
             false,
         );
         let boundary = boundary
-            .or_else(|| pending.and(self.servers[s].tabs[t].history_boundary))
+            .or_else(|| completion.and(self.servers[s].tabs[t].history_boundary))
             .unwrap_or(self.line_count(s, t));
         let policy = delivery_policy(Some(reason), self.servers[s].cold_start);
         self.servers[s].tabs[t].deduper.begin_history();
@@ -1452,17 +1452,22 @@ impl State {
                     .min(first),
             );
         }
-        if let Some(pending) = pending {
+        if let Some((pending, exhausted)) = completion {
             self.servers[s].tabs[t].history_boundary = if pending {
                 Some((edit.at + edit.inserted).saturating_sub(edit.trimmed))
             } else {
                 None
             };
             if !pending
+                && exhausted
                 && reason == HistoryReason::CatchUp
                 && self.servers[s].cold_start
-                && self.servers[s].tabs[t].first_chat.is_none()
             {
+                // The saved cursor tracks receipt, not a persisted transcript.
+                // Even a nonempty catch-up page needs recent context after a
+                // process restart. Insert it before chat already restored.
+                // Capped or stalled catch-up already has context and must retain
+                // its gap notice rather than fetching across that remaining gap.
                 self.request_history(s, t, HistoryReason::Initial, 100, None, false);
             }
         }
@@ -1837,11 +1842,18 @@ impl State {
                 reason,
                 messages,
                 pending,
-                ..
+                exhausted,
             } => {
                 let destination =
                     request_target(&mut self.servers[s].history_aliases, target, !pending);
-                self.restore_history(s, &destination, reason, messages, Some(pending), None);
+                self.restore_history(
+                    s,
+                    &destination,
+                    reason,
+                    messages,
+                    Some((pending, exhausted)),
+                    None,
+                );
                 if !pending {
                     self.refresh_contexts(s);
                 }

@@ -230,6 +230,35 @@ mod tests {
         assert!(n.enabled().enabled("server-time"));
     }
     #[test]
+    fn timestamp_history_survives_soju_withdrawing_message_tags() {
+        let mut n = Negotiation::new(CapOptions::default());
+        reply(
+            &mut n,
+            "CAP * LS :batch server-time message-tags draft/chathistory",
+        );
+        reply(
+            &mut n,
+            "CAP * ACK :batch server-time message-tags draft/chathistory",
+        );
+        reply(&mut n, "CAP * DEL :message-tags");
+        assert!(n.enabled().enabled("draft/chathistory"));
+        assert!(!n.enabled().enabled("message-tags"));
+        reply(&mut n, "CAP * DEL :batch");
+        assert!(!n.enabled().enabled("draft/chathistory"));
+    }
+    #[test]
+    fn timestamp_history_is_requested_without_message_tags() {
+        let mut n = Negotiation::new(CapOptions::default());
+        let actions = reply(&mut n, "CAP * LS :batch server-time draft/chathistory");
+        assert!(
+            sent(&actions)
+                .iter()
+                .any(|line| line.contains("draft/chathistory"))
+        );
+        reply(&mut n, "CAP * ACK :batch server-time draft/chathistory");
+        assert!(n.enabled().enabled("draft/chathistory"));
+    }
+    #[test]
     fn local_echo_all_chat_paths_and_unrelated_feedback() {
         let mut n = Negotiation::new(CapOptions::default());
         let commands = [
@@ -314,7 +343,9 @@ const SUPPORTED: &[&str] = &[
 ];
 fn dependencies(name: &str) -> &'static [&'static str] {
     match name {
-        "draft/chathistory" => &["batch", "server-time", "message-tags"],
+        // soju can withdraw message-tags after binding to an upstream without
+        // arbitrary tags. Timestamp-based history still works on that session.
+        "draft/chathistory" => &["batch", "server-time"],
         "draft/read-marker" => &["server-time"],
         "soju.im/bouncer-networks-notify" => &["soju.im/bouncer-networks", "batch"],
         _ => &[],

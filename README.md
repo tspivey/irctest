@@ -147,6 +147,10 @@ Supported servers provide recent context when joining a channel or opening a
 private conversation, and catch-up after reconnecting. TARGETS discovery can
 restore missed private conversations without joining parted channels. Message
 IDs are preferred for selectors; timestamp catch-up uses a five-second overlap.
+Timestamp-based history stays available when soju withdraws `message-tags` for
+an upstream network. After restarting the client, recent context is restored
+even when catch-up has already returned messages; saved cursors do not replace
+the conversation's displayed history.
 
 History is quiet: it does not speak messages or mentions, change focus, update
 live membership or nicknames, or answer old CTCP requests. Nested historical
@@ -263,10 +267,13 @@ AT-SPI bindings, xdotool, D-Bus and Xvfb, and does not use a real IRC account:
 cargo build --locked
 dbus-run-session -- xvfb-run -a python3 tests/gui_navigation.py
 dbus-run-session -- xvfb-run -a python3 tests/gui_soju_networks.py
+dbus-run-session -- xvfb-run -a python3 tests/gui_history.py
 ```
 
 The soju regression uses a local fake bouncer with five networks to check that
 children started from the connection queue also receive their network labels.
+The history regression checks first login and restart, chronological order,
+duplicate suppression and quiet playback, with and without `message-tags`.
 
 On Linux, the existing packaging task builds a release AppImage:
 
@@ -280,9 +287,9 @@ glibc and graphics drivers on the host.
 
 Automated tests exercise models, fake in-memory IRC sessions and native GTK
 tab/network keyboard navigation with focus and draft preservation. Live soju
-SASL login, discovery of five networks, their labels, and restored channel tabs
-were verified on Linux on 2026-10-21. Network rename/removal, reconnect with
-missed messages, and marker synchronization from a second device remain
+SASL login, discovery of five networks, their labels, restored channel tabs,
+and history retrieval were verified on Linux on 2026-10-21. Network rename/removal,
+reconnect with missed messages, and marker synchronization from a second device remain
 unperformed. Audible speech,
 screen-reader review, keyboard/focus behavior during history insertion, and
 Windows native selection/cursor behavior with Unicode also remain unperformed.
