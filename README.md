@@ -123,6 +123,12 @@ text starting with `/`.
 - `/query nick [message]`, or `/q`, opens a private conversation.
 - `/msg nick-or-channel message` sends a message directly.
 - `/me action` sends an action to the current conversation.
+- `/names` displays and speaks the current channel's known members alphabetically.
+  It uses that channel's local member list, sends no server request, and accepts
+  no arguments. Use it in a joined channel; server and private tabs give an
+  explanation. The spoken list omits mode prefixes and user addresses.
+- `/ctcp nick-or-channel command [arguments]` sends a CTCP request, for example
+  `/ctcp bob VERSION` or `/ctcp bob PING 12345`.
 - `/nick newnick` changes your nickname.
 - `/history [count]` retrieves older messages for the current conversation.
 - `/markread` explicitly marks displayed chat as read.
@@ -130,6 +136,18 @@ text starting with `/`.
 - `/quit [reason]` disconnects the current server or account group.
 - `/raw IRC command` and `/quote IRC command` send a raw IRC line. Unrecognized
   slash commands are also sent as IRC commands, for example `/whois nick`.
+
+`/ctcp` uppercases the command and preserves spacing inside its arguments.
+Requests use IRC PRIVMSG and replies use NOTICE. The client automatically answers
+live VERSION, PING, TIME, and CLIENTINFO requests privately, including requests
+received in channels. PING replies preserve the request's data. ACTION is
+supported through `/me` and `/ctcp target ACTION text`. Other requests, including
+DCC, are displayed without an automatic reply; file transfers are not supported.
+Non-ACTION CTCP requests and replies are displayed without chat speech or opening
+a private conversation. Replies appear in the sender's conversation if it is
+already open, otherwise in the server tab. Invalid `/ctcp` input gives usage help; control
+characters and requests exceeding the 510-byte IRC line limit are rejected.
+Malformed received CTCP frames and historical requests never trigger replies.
 
 `/history` defaults to 100 messages. Counts must be 1 through 1,000 and are
 clamped to the server's advertised limit. An empty conversation requests recent
@@ -261,6 +279,7 @@ connecting to a real account:
 
 ```sh
 cargo test --locked --lib cap::
+cargo test --locked --lib ctcp
 cargo test --locked --lib net::tests::
 cargo test --locked --lib playback::
 cargo test --locked --lib bouncer::
@@ -278,12 +297,19 @@ cargo build --locked
 dbus-run-session -- xvfb-run -a python3 tests/gui_navigation.py
 dbus-run-session -- xvfb-run -a python3 tests/gui_soju_networks.py
 dbus-run-session -- xvfb-run -a python3 tests/gui_history.py
+dbus-run-session -- xvfb-run -a python3 tests/gui_ctcp.py
+dbus-run-session -- xvfb-run -a python3 tests/gui_names.py
 ```
 
 The soju regression uses a local fake bouncer with five networks to check that
 children started from the connection queue also receive their network labels.
 The history regression checks first login and restart, chronological order,
 duplicate suppression and quiet playback, with and without `message-tags`.
+The CTCP regression types requests through the native Message input and checks
+wire framing, readable replies, usage help, quiet display and single display
+with and without `echo-message`.
+The names regression checks current-channel display and speech, membership
+updates, argument rejection, and that `/names` never sends a network request.
 
 On Linux, the existing packaging task builds a release AppImage:
 

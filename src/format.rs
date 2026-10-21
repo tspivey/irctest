@@ -250,10 +250,14 @@ pub fn spoken_channel(channel: &str) -> &str {
 }
 
 /// Splits `\x01COMMAND args\x01` into `("COMMAND", "args")`. The closing `\x01` is optional,
-/// as some clients leave it off.
+/// as some clients leave it off. Empty commands, mixed frames, and embedded line
+/// terminators are rejected.
 pub fn parse_ctcp(text: &str) -> Option<(&str, &str)> {
     let inner = text.strip_prefix('\x01')?;
     let inner = inner.strip_suffix('\x01').unwrap_or(inner);
+    if inner.is_empty() || inner.contains(['\0', '\x01', '\r', '\n']) || inner.starts_with(' ') {
+        return None;
+    }
     match inner.split_once(' ') {
         Some((cmd, args)) => Some((cmd, args)),
         None => Some((inner, "")),
@@ -453,6 +457,33 @@ mod tests {
             text(":bob!b@host NOTICE tyler :\x01VERSION mIRC 7\x01\r\n"),
             "CTCP VERSION reply from bob: mIRC 7"
         );
+    }
+
+    #[test]
+    fn ctcp_parser_preserves_parameters_and_accepts_missing_closing_delimiter() {
+        assert_eq!(
+            parse_ctcp("\x01PING 123  456 \x01"),
+            Some(("PING", "123  456 "))
+        );
+        assert_eq!(parse_ctcp("\x01ACTION waves"), Some(("ACTION", "waves")));
+        assert_eq!(parse_ctcp("\x01VERSION\x01"), Some(("VERSION", "")));
+    }
+
+    #[test]
+    fn ctcp_parser_rejects_empty_or_mixed_frames() {
+        for text in [
+            "hello",
+            "\x01",
+            "\x01\x01",
+            "\x01 PING 123\x01",
+            "\x01VERSION\x01plain text",
+            "\x01VERSION\x01\x01PING 123\x01",
+            "\x01PING a\0b\x01",
+            "\x01PING a\rb\x01",
+            "\x01PING a\nb\x01",
+        ] {
+            assert_eq!(parse_ctcp(text), None, "{text:?}");
+        }
     }
 
     #[test]

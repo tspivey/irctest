@@ -1185,6 +1185,7 @@ fn wire(msg: &Message) -> String {
 fn ctcp_reply(query: &str, args: &str) -> Option<String> {
     match query.to_ascii_uppercase().as_str() {
         "VERSION" => Some(format!("VERSION irctest {}", env!("CARGO_PKG_VERSION"))),
+        "PING" if args.is_empty() => Some("PING".into()),
         "PING" => Some(format!("PING {args}")),
         "TIME" => Some(format!("TIME {}", chrono::Local::now().to_rfc2822())),
         "CLIENTINFO" => Some("CLIENTINFO ACTION CLIENTINFO PING TIME VERSION".into()),
@@ -2078,6 +2079,64 @@ mod tests {
             .await;
         fake.send("PING :done").await;
         assert_eq!(fake.recv().await, "PONG done");
+    }
+
+    #[tokio::test]
+    async fn ctcp_ping_preserves_parameters_including_an_empty_payload() {
+        let mut fake = Fake::registered("", &[]).await;
+        for (body, reply) in [
+            ("\x01PING\x01", "NOTICE bob \x01PING\x01"),
+            (
+                "\x01PING 123  456 \x01",
+                "NOTICE bob :\x01PING 123  456 \x01",
+            ),
+            (
+                "\x01PING no-closing-delimiter",
+                "NOTICE bob :\x01PING no-closing-delimiter\x01",
+            ),
+        ] {
+            fake.send(&format!(":bob!u@h PRIVMSG tyler :{body}")).await;
+            assert_eq!(fake.recv().await, reply);
+        }
+    }
+
+    #[tokio::test]
+    async fn ctcp_clientinfo_and_time_reply_privately_to_channel_requests() {
+        let mut fake = Fake::registered("", &[]).await;
+        fake.send(":bob!u@h PRIVMSG #test :\x01CLIENTINFO\x01")
+            .await;
+        assert_eq!(
+            fake.recv().await,
+            "NOTICE bob :\x01CLIENTINFO ACTION CLIENTINFO PING TIME VERSION\x01"
+        );
+        let before = chrono::Utc::now().timestamp();
+        fake.send(":bob!u@h PRIVMSG #test :\x01TIME\x01").await;
+        let reply: Message = fake.recv().await.parse().unwrap();
+        let Command::NOTICE(target, body) = reply.command else {
+            panic!("TIME did not reply with NOTICE");
+        };
+        assert_eq!(target, "bob");
+        let (command, time) = parse_ctcp(&body).expect("TIME reply was not framed as CTCP");
+        assert_eq!(command, "TIME");
+        let time = chrono::DateTime::parse_from_rfc2822(time)
+            .unwrap()
+            .timestamp();
+        assert!((before..=chrono::Utc::now().timestamp()).contains(&time));
+    }
+
+    #[tokio::test]
+    async fn ctcp_malformed_frames_and_notices_never_trigger_replies() {
+        let mut fake = Fake::registered("", &[]).await;
+        for line in [
+            ":bob!u@h PRIVMSG tyler :\x01PING x\x01\x01VERSION\x01",
+            ":bob!u@h PRIVMSG tyler :\x01PING x\x01trailing text",
+            ":bob!u@h NOTICE tyler :\x01PING 123\x01",
+            ":bob!u@h NOTICE tyler :\x01VERSION\x01",
+        ] {
+            fake.send(line).await;
+        }
+        fake.send("PING :ctcp-fence").await;
+        assert_eq!(fake.recv().await, "PONG ctcp-fence");
     }
 
     #[tokio::test]

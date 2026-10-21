@@ -2241,6 +2241,11 @@ impl State {
             let time = message_time(msg).unwrap_or_else(Local::now);
             let tabs = self.route_to_tabs(s, msg, &me);
             let chat = displayed_chat(msg);
+            let quiet_ctcp = matches!(
+                &msg.command,
+                Command::PRIVMSG(_, body) | Command::NOTICE(_, body)
+                    if parse_ctcp(body).is_some_and(|(command, _)| command != "ACTION")
+            );
             if chat {
                 if let Some(&t) = tabs
                     .first()
@@ -2256,6 +2261,13 @@ impl State {
                 }
             }
             for &t in &tabs {
+                if quiet_ctcp {
+                    // The foreground server tab normally speaks every line, but CTCP
+                    // queries and replies stay quiet there as well as in conversations.
+                    self.append_output(s, t, &timestamped(time, &formatted.text));
+                    self.log_tab(s, t, time, &formatted.text);
+                    continue;
+                }
                 // An outgoing NOTICE without an open conversation is displayed on
                 // the server tab, but its log still belongs to the recipient.
                 if t == 0
@@ -2510,6 +2522,22 @@ impl State {
         let target = self.servers[s].tabs[t].name.clone();
 
         match input {
+            Input::Names => {
+                if kind != TabKind::Channel {
+                    return self.complain(s, t, "Use /names in the current channel.");
+                }
+                if !self.servers[s].tabs[t].joined {
+                    return self.complain(s, t, "Join the channel before using /names.");
+                }
+                let mut names: Vec<_> = self.servers[s].tabs[t].nicks.values().cloned().collect();
+                names.sort_by_cached_key(|nick| irc_lower(nick));
+                let names = names.join(", ");
+                self.line(s, t, &format!("Users on {target}: {names}"));
+                self.speech.say(
+                    &format!("Users on {}: {names}", spoken_channel(&target)),
+                    true,
+                );
+            }
             Input::History { count } => {
                 if kind == TabKind::Server {
                     return self.complain(

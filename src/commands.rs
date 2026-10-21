@@ -35,6 +35,8 @@ pub enum Input {
         count: usize,
     },
     MarkRead,
+    /// `/names`: list the current channel's cached members locally.
+    Names,
     /// `/raw line`, `/quote line`, or any other `/command args`.
     Raw(String),
     /// The command was recognised but used wrongly; the text says how to use it.
@@ -64,6 +66,33 @@ pub fn parse_input(line: &str) -> Option<Input> {
             },
             _ => Input::Usage("Usage: /msg nick-or-channel message"),
         },
+        "ctcp" => {
+            let (target, query) = split_word(rest);
+            let (command, args) = split_word(query);
+            let command = command.to_ascii_uppercase();
+            let text = if args.is_empty() {
+                format!("\x01{command}\x01")
+            } else {
+                format!("\x01{command} {args}\x01")
+            };
+            if target.is_empty()
+                || target.starts_with(':')
+                || target.chars().any(char::is_whitespace)
+                || command.is_empty()
+                || command.chars().any(char::is_whitespace)
+                || command_line.chars().any(char::is_control)
+                || format!("PRIVMSG {target} :{text}").len() > 510
+            {
+                Input::Usage(
+                    "Usage: /ctcp nick-or-channel command [arguments] (one IRC line, at most 510 bytes; no control characters)",
+                )
+            } else {
+                Input::Msg {
+                    target: target.into(),
+                    text,
+                }
+            }
+        }
         "join" | "j" if rest.is_empty() => Input::Usage("Usage: /join #channel [key]"),
         "join" | "j" => Input::Join(rest.to_string()),
         "part" | "leave" => {
@@ -103,6 +132,8 @@ pub fn parse_input(line: &str) -> Option<Input> {
         },
         "markread" if rest.is_empty() => Input::MarkRead,
         "markread" => Input::Usage("Usage: /markread (explicitly mark displayed messages as read)"),
+        "names" if rest.is_empty() => Input::Names,
+        "names" => Input::Usage("Usage: /names (current channel only; no arguments)"),
         "raw" | "quote" if rest.is_empty() => Input::Usage("Usage: /raw IRC command"),
         "raw" | "quote" => Input::Raw(rest.to_string()),
         _ => Input::Raw(command_line.trim().to_string()),
@@ -254,6 +285,75 @@ mod tests {
             }
         );
         assert!(matches!(p("/msg bob"), Input::Usage(_)));
+    }
+
+    #[test]
+    fn ctcp_sends_framed_queries_through_the_message_path() {
+        for (input, target, text) in [
+            ("/ctcp bob version", "bob", "\x01VERSION\x01"),
+            (
+                "/CTCP #test ping 123  456",
+                "#test",
+                "\x01PING 123  456\x01",
+            ),
+            ("/ctcp bob CLIENTINFO", "bob", "\x01CLIENTINFO\x01"),
+            ("/ctcp bob action waves", "bob", "\x01ACTION waves\x01"),
+            (
+                "/ctcp bob CUSTOM some data",
+                "bob",
+                "\x01CUSTOM some data\x01",
+            ),
+        ] {
+            assert_eq!(
+                p(input),
+                Input::Msg {
+                    target: target.into(),
+                    text: text.into()
+                },
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctcp_rejects_missing_arguments_and_control_characters() {
+        for input in [
+            "/ctcp",
+            "/ctcp bob",
+            "/ctcp bob   ",
+            "/ctcp :bob VERSION",
+            "/ctcp bob\tother VERSION",
+            "/ctcp bob VER\x01SION",
+            "/ctcp bob PING a\x01VERSION",
+            "/ctcp bob PING a\0b",
+            "/ctcp bob PING a\rQUIT",
+            "/ctcp bob PING a\nQUIT",
+            "/ctcp bob VERSION\n",
+        ] {
+            assert!(matches!(p(input), Input::Usage(_)), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn ctcp_respects_the_irc_line_byte_limit() {
+        // PRIVMSG bob : + delimiters + PING and its separator use 20 bytes.
+        let fits = format!("/ctcp bob PING {}", "é".repeat(245));
+        assert!(matches!(p(&fits), Input::Msg { .. }));
+        assert!(matches!(p(&(fits + "x")), Input::Usage(_)));
+    }
+
+    #[test]
+    fn names_is_local_and_rejects_channel_arguments() {
+        assert_eq!(p("/names"), Input::Names);
+        assert_eq!(p("/NAMES"), Input::Names);
+        for input in [
+            "/names #other",
+            "/NAMES #here",
+            "/names bob",
+            "/names #one,#two",
+        ] {
+            assert!(matches!(p(input), Input::Usage(_)), "{input:?}");
+        }
     }
 
     #[test]
