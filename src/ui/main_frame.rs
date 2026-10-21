@@ -263,6 +263,9 @@ impl MainFrame {
                         ..config
                     };
                     let connect = result.connect.map(|i| config.servers[i].clone());
+                    for (old, new) in result.renames {
+                        state.borrow_mut().rename_server_config(&old, &new);
+                    }
                     state.borrow_mut().set_config(config);
                     if let Some(server) = connect {
                         state.borrow_mut().connect(server);
@@ -291,14 +294,24 @@ impl MainFrame {
                     }
                 }
                 ID_IGNORE => {
-                    let (ignored, channels) = {
+                    let (servers, selected) = {
                         let state = state.borrow();
-                        (state.config().ignored.clone(), state.ignore_channels())
+                        (
+                            state.config().servers.clone(),
+                            state.ignore_server_selection(),
+                        )
                     };
-                    if let Some(ignored) = edit_ignores(&frame, &ignored, &channels) {
+                    if let Some(servers) = edit_ignores(&frame, &servers, selected) {
                         // Events can update settings while the modal dialog is open.
                         let mut config = state.borrow().config().clone();
-                        config.ignored = ignored;
+                        for saved in &mut config.servers {
+                            if let Some(edited) = servers
+                                .iter()
+                                .find(|edited| irctest::route::irc_eq(&edited.name, &saved.name))
+                            {
+                                saved.ignored = edited.ignored.clone();
+                            }
+                        }
                         if let Err(e) = config.save() {
                             message(&frame, &format!("Couldn't save ignores:\n\n{e}"));
                         }

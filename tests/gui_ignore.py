@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import socketserver
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -33,12 +34,12 @@ class Session(socketserver.StreamRequestHandler):
                 if command == "NICK":
                     nickname = arguments
                 elif line == "CAP LS 302":
-                    send("CAP * LS :batch server-time message-tags draft/chathistory")
+                    send("CAP * LS :" if self.server.other else "CAP * LS :batch server-time message-tags draft/chathistory")
                 elif line.startswith("CAP REQ "):
                     send("CAP * ACK " + arguments.removeprefix("REQ "))
                 elif line == "CAP END":
                     send(f":srv 001 {nickname} :Welcome", f":srv 422 {nickname} :No MOTD")
-                    for channel in ("#red", "#blue"):
+                    for channel in (("#other",) if self.server.other else ("#red", "#blue")):
                         send(f":{nickname}!u@h JOIN {channel}",
                              f":srv 353 {nickname} = {channel} :{nickname} Bob Alice",
                              f":srv 366 {nickname} {channel} :End of names")
@@ -70,6 +71,10 @@ class Session(socketserver.StreamRequestHandler):
                          f":Alice!u@h PRIVMSG #red :hidden red channel {phase}",
                          f":Alice!u@h NOTICE #red :hidden red notice {phase}",
                          f":Alice!u@h PRIVMSG #blue :visible Alice {phase}")
+                elif command == "TEST-OTHER":
+                    send(":Bob!u@h PRIVMSG #other :visible Bob other server",
+                         ":Alice!u@h PRIVMSG #red :visible red other server",
+                         f":Bob!u@h PRIVMSG {nickname} :\x01VERSION\x01")
                 elif command == "TEST-UNIGNORE":
                     send(":Bob!u@h PRIVMSG #blue :unignored Bob",
                          ":Alice!u@h PRIVMSG #red :unignored red",
@@ -87,8 +92,12 @@ class Session(socketserver.StreamRequestHandler):
 
 
 def run():
-    with Server(("127.0.0.1", 0), Session) as server, tempfile.TemporaryDirectory(prefix="irctest-ignore-") as directory:
+    with Server(("127.0.0.1", 0), Session) as server, Server(("127.0.0.1", 0), Session) as other, tempfile.TemporaryDirectory(prefix="irctest-ignore-") as directory:
         server.sent_messages = []
+        server.other = False
+        other.sent_messages = []
+        other.other = True
+        threading.Thread(target=other.serve_forever, daemon=True).start()
         threading.Thread(target=server.serve_forever, daemon=True).start()
         config_path = Path(directory, "irctest.toml")
         config_path.write_text(f'''nickname = "me"
@@ -97,6 +106,11 @@ log = false
 name = "test"
 host = "127.0.0.1"
 port = {server.server_address[1]}
+auto_connect = true
+[[servers]]
+name = "other"
+host = "127.0.0.1"
+port = {other.server_address[1]}
 auto_connect = true
 ''')
         try:
@@ -124,6 +138,8 @@ auto_connect = true
 
                         def action(name):
                             node = wait_for(lambda: named(name), f"missing control {name}")
+                            if node.get_state_set().contains(Atspi.StateType.FOCUSABLE):
+                                assert Atspi.Component.grab_focus(node), f"could not focus {name}"
                             assert Atspi.Action.do_action(node, 0), f"could not activate {name}"
                             time.sleep(0.1)
 
@@ -143,46 +159,102 @@ auto_connect = true
                         def open_ignore():
                             key("alt+s")
                             key("i")
-                            return wait_for(lambda: named("Ignore"), "Ignore dialog did not open")
+                            dialog = wait_for(lambda: named("Ignore"), "Ignore dialog did not open")
+                            window = subprocess.check_output(["xdotool", "search", "--all", "--onlyvisible", "--pid",
+                                                              str(client.pid), "--name", "^Ignore$"], text=True).splitlines()[0]
+                            subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
+                            wait_for(lambda: any(n.get_state_set().contains(Atspi.StateType.FOCUSED)
+                                                 for n in walk(server_combo())),
+                                     "server selector did not receive initial focus")
+                            focus_server()
+                            return dialog
 
-                        def checkbox(channel):
-                            return wait_for(lambda: named(f"Ignore this channel: {channel}"),
-                                            f"missing checkbox for {channel}")
+                        def checkbox(name):
+                            return wait_for(lambda: next((n for n in nodes()
+                                if n.get_role() == Atspi.Role.CHECK_BOX and n.get_name() == name), None),
+                                f"missing ignored-name checkbox for {name}")
 
-                        def checked(channel):
-                            return checkbox(channel).get_state_set().contains(Atspi.StateType.CHECKED)
+                        def checked(name):
+                            return checkbox(name).get_state_set().contains(Atspi.StateType.CHECKED)
+
+                        def server_combo():
+                            return wait_for(lambda: next((n for n in nodes()
+                                if n.get_role() == Atspi.Role.COMBO_BOX), None),
+                                "missing server combo box")
+
+                        def focus_server():
+                            # GTK's read-only combo exposes focus on an inner text control.
+                            # Enter it through keyboard navigation from the following field.
+                            assert Atspi.Component.grab_focus(name_field())
+                            key("shift+Tab")
+
+                        def name_field():
+                            return next(n for n in walk(named("Ignore")) if n.get_role() == Atspi.Role.TEXT
+                                and n.get_state_set().contains(Atspi.StateType.EDITABLE)
+                                and n.get_state_set().contains(Atspi.StateType.SHOWING))
+
+                        def add_name(value):
+                            assert Atspi.Component.grab_focus(name_field())
+                            type_text(value)
+                            action("Add")
+
+                        def saved_ignores():
+                            saved = tomllib.loads(config_path.read_text())
+                            assert "ignored" not in saved, "ignores are still global"
+                            return saved["servers"][0]["ignored"]
 
                         wait_for(lambda: named("#blue"), "channel tabs missing")
-                        window = subprocess.check_output(["xdotool", "search", "--onlyvisible", "--pid",
+                        wait_for(lambda: named("#other"), "other server channel missing")
+                        window = subprocess.check_output(["xdotool", "search", "--all", "--onlyvisible", "--pid",
                                                           str(client.pid), "--name", "^irctest$"], text=True).splitlines()[0]
                         subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
+                        if attempt == 0:
+                            # Renaming a connected server must preserve its ignore association.
+                            key("ctrl+shift+s")
+                            wait_for(lambda: named("Manage servers"), "server manager did not open")
+                            assert Atspi.Component.grab_focus(named("Edit..."))
+                            key("space")
+                            editor = wait_for(lambda: named("Edit server"), "server editor did not open")
+                            server_name = next(n for n in walk(editor) if n.get_role() == Atspi.Role.TEXT
+                                               and n.get_state_set().contains(Atspi.StateType.EDITABLE))
+                            assert Atspi.Component.grab_focus(server_name)
+                            key("ctrl+a")
+                            type_text("renamed")
+                            action("OK")
+                            action("Close")
                         open_ignore()
                         if attempt == 0:
-                            assert not checked("#red") and not checked("#blue"), "channels ignored by default"
-                            # The name field starts focused; Tab and Enter add a name.
+                            assert not any(n.get_role() == Atspi.Role.CHECK_BOX for n in nodes()), "channel checkbox section remains"
+                            key("Tab")
+                            assert name_field().get_state_set().contains(Atspi.StateType.FOCUSED), "name field must follow server selector"
                             type_text("BOB")
                             key("Tab")
                             key("Return")
-                            key("Tab")
-                            key("Tab")
-                            assert checkbox("#blue").get_state_set().contains(Atspi.StateType.FOCUSED), "Tab did not reach channel checkboxes"
-                            key("Tab")
-                            assert checkbox("#red").get_state_set().contains(Atspi.StateType.FOCUSED)
-                            key("space")
-                            assert checked("#red"), "Space did not check channel"
+                            add_name("#red")
+                            # Switching servers replaces the list without saving yet.
+                            focus_server()
+                            key("End")
+                            assert not any(n.get_role() == Atspi.Role.CHECK_BOX for n in nodes()), "ignore list leaked into another server"
+                            add_name("OtherOnly")
+                            assert not checked("OtherOnly")
+                            focus_server()
+                            key("Home")
+                            assert not named("OtherOnly"), "another server's ignore leaked into this list"
+                            assert not checked("BOB") and not checked("#red"), "removal checks must start unchecked"
+                            assert not named("Remove ignore").get_state_set().contains(Atspi.StateType.ENABLED)
                             action("OK")
-                            saved = tomllib.loads(config_path.read_text())
-                            assert sorted(saved["ignored"]) == ["#red", "BOB"], saved
-                            # Cancellation discards both a removed channel and a typed name.
+                            assert sorted(saved_ignores()) == ["#red", "BOB"]
+                            assert tomllib.loads(config_path.read_text())["servers"][1]["ignored"] == ["OtherOnly"]
+                            # Cancellation discards additions and selected removals.
                             open_ignore()
-                            type_text("Mallory")
-                            action("Add")
+                            add_name("Mallory")
                             assert Atspi.Component.grab_focus(checkbox("#red"))
                             key("space")
+                            action("Remove ignore")
                             action("Cancel")
-                            assert tomllib.loads(config_path.read_text())["ignored"] == saved["ignored"]
+                            assert sorted(saved_ignores()) == ["#red", "BOB"]
                         else:
-                            assert checked("#red") and not checked("#blue"), "saved channel checks lost"
+                            assert not checked("#red") and not checked("BOB"), "reopened removal checks should be unchecked"
                             action("Cancel")
                             wait_for(lambda: "saved Alice #blue" in output(), "allowed history missing")
                             assert "hidden saved Bob" not in output(), "ignored nickname leaked through history"
@@ -192,7 +264,7 @@ auto_connect = true
                             assert "hidden saved Bob private" not in output(), "ignored private history leaked"
 
                         # Select #blue so allowed live chat also exercises the speech path.
-                        for _ in range(3):
+                        for _ in range(1 + sum(n.get_role() == Atspi.Role.PAGE_TAB for n in nodes())):
                             if any(n.get_role() == Atspi.Role.PAGE_TAB and n.get_name().startswith("#blue")
                                    and n.get_state_set().contains(Atspi.StateType.SELECTED) for n in nodes()):
                                 break
@@ -234,11 +306,13 @@ auto_connect = true
                                 wait_for(lambda: output().count("Person or channel on ignore.") > before,
                                          f"missing ignore explanation for {value!r}")
                             # Plain messages in an ignored channel use the same rule.
-                            for _ in range(4):
+                            for _ in range(1 + sum(n.get_role() == Atspi.Role.PAGE_TAB for n in nodes())):
                                 if any(n.get_role() == Atspi.Role.PAGE_TAB and n.get_name().startswith("#red")
                                        and n.get_state_set().contains(Atspi.StateType.SELECTED) for n in nodes()):
                                     break
                                 key("ctrl+Tab")
+                            assert any(n.get_role() == Atspi.Role.PAGE_TAB and n.get_name().startswith("#red")
+                                       and n.get_state_set().contains(Atspi.StateType.SELECTED) for n in nodes()), "could not select #red"
                             before = output().count("Person or channel on ignore.")
                             command("blocked-outgoing-channel-current")
                             wait_for(lambda: output().count("Person or channel on ignore.") > before,
@@ -250,18 +324,47 @@ auto_connect = true
                             log.seek(0)
                             assert "Person or channel on ignore." in log.read(), "ignore explanation was silent"
 
+                        # The same names stay visible and sendable on another server.
+                        key("ctrl+Next")
+                        open_ignore()
+                        assert not checked("OtherOnly"), "current server was not selected in the combo box"
+                        assert not any(n.get_role() == Atspi.Role.CHECK_BOX
+                                       and n.get_name() in ("BOB", "#red")
+                                       for n in walk(named("Ignore"))), "server-specific list leaked"
+                        action("Cancel")
+                        before_other = len(other.sent_messages)
+                        command("/quote TEST-OTHER")
+                        wait_for(lambda: "visible Bob other server" in output()
+                                 and "visible red other server" in output(), "ignores leaked into another server's incoming messages")
+                        command("/msg Bob allowed-other-person")
+                        command("/msg #red allowed-other-channel")
+                        command("/quote TEST-SENT other")
+                        wait_for(lambda: "send barrier other" in output(), "other server barrier missing")
+                        sent_other = other.sent_messages[before_other:]
+                        assert len(sent_other) == 3, sent_other
+                        assert any("allowed-other-person" in line for line in sent_other), sent_other
+                        assert any("allowed-other-channel" in line for line in sent_other), sent_other
+                        assert any(line.startswith("NOTICE Bob ") and "VERSION" in line for line in sent_other), sent_other
+                        key("ctrl+Prior")
+
                         if attempt == 1:
                             open_ignore()
-                            # Uncheck a channel and remove the remaining nickname entry.
-                            assert Atspi.Component.grab_focus(checkbox("#red"))
+                            # Checking names alone does not unignore them.
+                            assert Atspi.Component.grab_focus(checkbox("BOB"))
+                            key("space")
+                            action("OK")
+                            assert sorted(saved_ignores()) == ["#red", "BOB"]
+                            open_ignore()
+                            assert Atspi.Component.grab_focus(checkbox("BOB"))
                             key("space")
                             key("Tab")
-                            key("Home")
+                            assert checkbox("#red").get_state_set().contains(Atspi.StateType.FOCUSED), "Tab should reach the next ignored name"
+                            key("space")
                             key("Tab")
-                            assert named("Remove").get_state_set().contains(Atspi.StateType.FOCUSED), "Tab did not reach Remove from the ignore list"
+                            assert named("Remove ignore").get_state_set().contains(Atspi.StateType.FOCUSED), "Tab should reach Remove ignore"
                             key("Return")
                             action("OK")
-                            assert tomllib.loads(config_path.read_text())["ignored"] == []
+                            assert saved_ignores() == []
                             command("/quote TEST-UNIGNORE")
                             wait_for(lambda: "unignored Bob" in output() and "unignored red" in output(),
                                      "removing ignores did not restore messages")
@@ -276,12 +379,16 @@ auto_connect = true
                         action("Exit")
                         client.wait(timeout=5)
                     finally:
+                        if sys.exc_info()[0] is not None:
+                            log.seek(0)
+                            print(log.read(), flush=True)
                         if client.poll() is None:
                             client.terminate()
                             client.wait(timeout=5)
-            print("PASS: ignore controls, live/history filtering, blocked outgoing commands, automatic replies, silence, cancel, restart and removal")
+            print("PASS: per-server ignore controls, batch removal, live/history filtering, blocked sends, automatic replies, silence, cancel and restart")
         finally:
             server.shutdown()
+            other.shutdown()
 
 
 if __name__ == "__main__":

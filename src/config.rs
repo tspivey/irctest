@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const CONFIG_FILE: &str = "irctest.toml";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, from = "StoredConfig")]
 pub struct Config {
     /// Used for every server whose own nickname is blank.
     pub nickname: String,
@@ -19,12 +19,35 @@ pub struct Config {
     pub realname: String,
     /// Write conversations to `logs/<server>/<target>/YYYY-MM-DD.log`.
     pub log: bool,
-    /// Exact nicknames and channel names to hide, on every network.
-    pub ignored: Vec<String>,
     pub servers: Vec<ServerConfig>,
 }
 
 impl Default for Config {
+    fn default() -> Self {
+        Self {
+            nickname: String::new(),
+            username: String::new(),
+            realname: String::new(),
+            log: true,
+            servers: Vec::new(),
+        }
+    }
+}
+
+// Read the former global list once and preserve it on each existing server.
+// New servers never inherit ignores, and saves only write server-specific lists.
+#[derive(Deserialize)]
+#[serde(default)]
+struct StoredConfig {
+    nickname: String,
+    username: String,
+    realname: String,
+    log: bool,
+    ignored: Vec<String>,
+    servers: Vec<ServerConfig>,
+}
+
+impl Default for StoredConfig {
     fn default() -> Self {
         Self {
             nickname: String::new(),
@@ -37,9 +60,30 @@ impl Default for Config {
     }
 }
 
+impl From<StoredConfig> for Config {
+    fn from(mut stored: StoredConfig) -> Self {
+        for server in &mut stored.servers {
+            for name in &stored.ignored {
+                if !crate::ignore::contains(&server.ignored, name) {
+                    server.ignored.push(name.clone());
+                }
+            }
+        }
+        Self {
+            nickname: stored.nickname,
+            username: stored.username,
+            realname: stored.realname,
+            log: stored.log,
+            servers: stored.servers,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
+    /// Exact nicknames and channel names to hide on this configured server.
+    pub ignored: Vec<String>,
     pub name: String,
     pub host: String,
     pub port: u16,
@@ -64,6 +108,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            ignored: Vec::new(),
             name: String::new(),
             host: String::new(),
             port: 6667,
@@ -187,8 +232,8 @@ mod tests {
             username: String::new(),
             realname: "Tyler".into(),
             log: false,
-            ignored: Vec::new(),
             servers: vec![ServerConfig {
+                ignored: Vec::new(),
                 name: "lan".into(),
                 host: "10.0.0.2".into(),
                 port: 6667,
@@ -233,18 +278,54 @@ mod tests {
     }
 
     #[test]
-    fn ignore_list_survives_config_save() {
+    fn ignore_lists_are_saved_separately_for_each_server() {
         let file = TempFile::new("ignored");
-        let config: Config = toml::from_str("ignored = ['Bob', '#quiet']\n").unwrap();
+        let config: Config = toml::from_str(
+            "[[servers]]\nname = 'one'\nignored = ['Bob', '#quiet']\n\n[[servers]]\nname = 'two'\nignored = ['Alice']\n",
+        ).unwrap();
         config.save_to(&file.0).unwrap();
         let saved: toml::Value =
             toml::from_str(&std::fs::read_to_string(&file.0).unwrap()).unwrap();
+        assert!(saved.get("ignored").is_none(), "ignores must not be global");
         assert_eq!(
-            saved.get("ignored").and_then(toml::Value::as_array),
-            Some(&vec![
+            saved["servers"][0]["ignored"].as_array().unwrap(),
+            &vec![
                 toml::Value::String("Bob".into()),
                 toml::Value::String("#quiet".into())
-            ])
+            ]
+        );
+        assert_eq!(
+            saved["servers"][1]["ignored"].as_array().unwrap(),
+            &vec![toml::Value::String("Alice".into())]
+        );
+        assert_eq!(Config::load_from(&file.0).unwrap(), config);
+    }
+
+    #[test]
+    fn legacy_global_ignores_migrate_to_existing_servers_only() {
+        let file = TempFile::new("legacy-ignored");
+        std::fs::write(&file.0,
+            "ignored = ['Bob', '#quiet']\n[[servers]]\nname = 'one'\nignored = ['bOB', 'Alice']\n[[servers]]\nname = 'two'\n"
+        ).unwrap();
+        let config = Config::load_from(&file.0).unwrap();
+        config.save_to(&file.0).unwrap();
+        let saved: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&file.0).unwrap()).unwrap();
+        assert!(saved.get("ignored").is_none());
+        assert_eq!(
+            saved["servers"][0]["ignored"].as_array().unwrap(),
+            &vec![
+                toml::Value::String("bOB".into()),
+                toml::Value::String("Alice".into()),
+                toml::Value::String("#quiet".into())
+            ]
+        );
+        assert_eq!(
+            saved["servers"][1]["ignored"].as_array().unwrap(),
+            &vec![
+                toml::Value::String("Bob".into()),
+                toml::Value::String("#quiet".into())
+            ]
         );
     }
 

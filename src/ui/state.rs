@@ -451,27 +451,37 @@ impl State {
             self.logger.close_all();
         }
         for server in &mut self.servers {
-            server.active_config.ignored = config.ignored.clone();
+            if let Some(saved) = config
+                .servers
+                .iter()
+                .find(|saved| irc_eq(&saved.name, &server.config.name))
+            {
+                server.config.ignored = saved.ignored.clone();
+            }
             if let Some(sender) = &server.sender {
-                sender.set_ignored(&config.ignored);
+                sender.set_ignored(&server.config.ignored);
             }
         }
         self.config = config;
     }
 
-    /// One checkbox per channel name; ignores apply equally to every network.
-    pub fn ignore_channels(&self) -> Vec<String> {
-        let mut channels = Vec::new();
-        for server in &self.servers {
-            for tab in &server.tabs {
-                if tab.kind == TabKind::Channel && !irctest::ignore::contains(&channels, &tab.name)
-                {
-                    channels.push(tab.name.clone());
-                }
+    /// Preserve the link to saved settings when the manager renames a server.
+    /// Discovered networks share the same configured server name.
+    pub fn rename_server_config(&mut self, old: &str, new: &str) {
+        for server in &mut self.servers {
+            if irc_eq(&server.config.name, old) {
+                server.config.name = new.to_string();
             }
         }
-        channels.sort_by_key(|name| irc_lower(name));
-        channels
+    }
+
+    /// Prefer the configured server for the currently selected conversation.
+    pub fn ignore_server_selection(&self) -> Option<usize> {
+        let (s, _) = self.current_tab()?;
+        self.config
+            .servers
+            .iter()
+            .position(|saved| irc_eq(&saved.name, &self.servers[s].config.name))
     }
 
     /// Connects every server marked auto-connect.
@@ -520,7 +530,7 @@ impl State {
         if self.shutting_down || self.servers[s].task.is_some() {
             return;
         }
-        let mut active_config = if let Some(parent) = self.servers[s].parent {
+        let active_config = if let Some(parent) = self.servers[s].parent {
             let Some(parent) = self.servers.iter().position(|p| p.id == parent) else {
                 return;
             };
@@ -528,7 +538,6 @@ impl State {
         } else {
             self.config.clone()
         };
-        active_config.ignored = self.config.ignored.clone();
         let account = AccountKey::from_config(&active_config, &self.servers[s].config);
         let changed = account != self.servers[s].account_key;
         if changed {
@@ -1565,8 +1574,9 @@ impl State {
             }
             // Keep paging/receipt cursors moving even across fully ignored pages.
             self.observe_chat(s, t, &message);
-            if (target.is_channel_name() && irctest::ignore::contains(&self.config.ignored, target))
-                || irctest::ignore::message_ignored(&self.config.ignored, &message)
+            if (target.is_channel_name()
+                && irctest::ignore::contains(&self.servers[s].config.ignored, target))
+                || irctest::ignore::message_ignored(&self.servers[s].config.ignored, &message)
             {
                 continue;
             }
@@ -2116,7 +2126,7 @@ impl State {
                 self.refresh_contexts(s);
             }
             NetEvent::Connected(sender) => {
-                sender.set_ignored(&self.config.ignored);
+                sender.set_ignored(&self.servers[s].config.ignored);
                 self.servers[s].sender = Some(sender);
                 self.line(s, 0, "Connected.");
             }
@@ -2261,7 +2271,7 @@ impl State {
     }
 
     fn handle_message(&mut self, s: usize, msg: &Message) {
-        let ignored = irctest::ignore::message_ignored(&self.config.ignored, msg);
+        let ignored = irctest::ignore::message_ignored(&self.servers[s].config.ignored, msg);
         if ignored && matches!(msg.command, Command::PRIVMSG(..) | Command::NOTICE(..)) {
             return;
         }
@@ -2279,7 +2289,7 @@ impl State {
                     !ignored
                         && !(self.servers[s].tabs[t].kind == TabKind::Channel
                             && irctest::ignore::contains(
-                                &self.config.ignored,
+                                &self.servers[s].config.ignored,
                                 &self.servers[s].tabs[t].name,
                             ))
                 })
@@ -2735,7 +2745,7 @@ impl State {
             text.into()
         };
         let message: Message = Command::PRIVMSG(target.into(), body).into();
-        if irctest::ignore::outgoing_ignored(&self.config.ignored, &message.command) {
+        if irctest::ignore::outgoing_ignored(&self.servers[s].config.ignored, &message.command) {
             self.complain(s, t, "Person or channel on ignore.");
             return;
         }
@@ -2764,7 +2774,8 @@ impl State {
 
     fn send_raw(&mut self, s: usize, t: usize, sender: &Sender, line: &str) {
         if let Ok(message) = line.trim().parse::<Message>() {
-            if irctest::ignore::outgoing_ignored(&self.config.ignored, &message.command) {
+            if irctest::ignore::outgoing_ignored(&self.servers[s].config.ignored, &message.command)
+            {
                 self.complain(s, t, "Person or channel on ignore.");
                 return;
             }

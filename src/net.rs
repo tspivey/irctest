@@ -246,7 +246,7 @@ impl Registration {
             username: config.effective_username(server).to_string(),
             realname: config.effective_realname(server).to_string(),
             connect_commands: server.connect_commands.clone(),
-            ignored: config.ignored.clone(),
+            ignored: server.ignored.clone(),
             sasl_username: match server.sasl_username.trim() {
                 "" => nick.to_string(),
                 user => user.to_string(),
@@ -2029,10 +2029,10 @@ mod tests {
     async fn saved_ignores_block_connect_messages_and_automatic_replies() {
         let config = Config {
             nickname: "tyler".into(),
-            ignored: vec!["Bob".into(), "#quiet".into()],
             ..Config::default()
         };
         let server = ServerConfig {
+            ignored: vec!["Bob".into(), "#quiet".into()],
             connect_commands: vec![
                 "PRIVMSG Bob :blocked configured message".into(),
                 "NOTICE #QUIET :blocked configured notice".into(),
@@ -2269,6 +2269,24 @@ mod tests {
             fake.session.await.unwrap(),
             ("Connection closed.".into(), true)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bouncer_control_connection_keeps_alive_with_server_pongs() {
+        let mut fake = bouncer_session(None).await;
+        fake.send(":s 903 tyler :Authenticated").await;
+        assert_eq!(fake.recv().await, "CAP END");
+        fake.send(":s 001 tyler :Welcome to soju").await;
+        fake.send(":s 005 tyler soju.im/SAFERATE :supported").await;
+        fake.send(":s 422 tyler :No MOTD").await;
+        assert_eq!(fake.recv().await, "BOUNCER LISTNETWORKS");
+        for _ in 0..3 {
+            let ping = fake.recv().await;
+            let token = ping.strip_prefix("PING ").expect("missing keepalive PING");
+            fake.send(&format!(":s PONG s :{token}")).await;
+        }
+        assert!(!fake.session.is_finished());
+        fake.session.abort();
     }
 
     #[tokio::test(start_paused = true)]

@@ -15,6 +15,8 @@ pub struct ManageResult {
     pub servers: Vec<ServerConfig>,
     /// Index into `servers` of the server to connect to, if Connect was pressed.
     pub connect: Option<usize>,
+    /// Ordered name changes, so running connections keep their configured identity.
+    pub renames: Vec<(String, String)>,
 }
 
 /// Shows the server manager. `save` is called after every change so nothing is lost if the
@@ -24,6 +26,7 @@ pub fn manage_servers(parent: &dyn WxWidget, config: &Config, save: impl Fn(&[Se
         .with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder)
         .build();
     let servers = Rc::new(RefCell::new(config.servers.clone()));
+    let renames = Rc::new(RefCell::new(Vec::new()));
 
     let label = StaticText::builder(&dialog).with_label("&Servers").build();
     let list = ListBox::builder(&dialog).build();
@@ -101,12 +104,16 @@ pub fn manage_servers(parent: &dyn WxWidget, config: &Config, save: impl Fn(&[Se
     }
     {
         let (servers, save, refresh) = (servers.clone(), save.clone(), refresh.clone());
+        let renames = renames.clone();
         edit.on_click(move |_| {
             let Some(index) = list.get_selection().map(|i| i as usize) else { return };
             let current = servers.borrow()[index].clone();
             let names: Vec<String> =
                 servers.borrow().iter().enumerate().filter(|(i, _)| *i != index).map(|(_, s)| s.name.clone()).collect();
             if let Some(server) = edit_server(&dialog, "Edit server", &current, &names) {
+                if current.name != server.name {
+                    renames.borrow_mut().push((current.name.clone(), server.name.clone()));
+                }
                 servers.borrow_mut()[index] = server;
                 save_or_complain(&dialog, &*save, &servers.borrow());
                 refresh(Some(index));
@@ -148,7 +155,8 @@ pub fn manage_servers(parent: &dyn WxWidget, config: &Config, save: impl Fn(&[Se
     dialog.destroy();
     let servers = servers.borrow().clone();
     let connect = if code == ID_CONNECT { *connect_index.borrow() } else { None };
-    ManageResult { servers, connect }
+    let renames = renames.borrow().clone();
+    ManageResult { servers, connect, renames }
 }
 
 /// The list entry for a server: "lan (10.0.0.2:6667, TLS, auto-connect)".

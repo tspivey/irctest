@@ -158,6 +158,7 @@ pub fn edit_server(
     let result: Rc<RefCell<Option<ServerConfig>>> = Rc::default();
     let other_names = other_names.to_vec();
     let ok_result = result.clone();
+    let ignored = server.ignored.clone();
     ok.on_click(move |_| {
         let host_value = host.get_value().trim().to_string();
         if host_value.is_empty() {
@@ -174,6 +175,7 @@ pub fn edit_server(
             return complain(&dialog, "Another server already has that name.", &name);
         }
         *ok_result.borrow_mut() = Some(ServerConfig {
+            ignored: ignored.clone(),
             name: name_value,
             host: host_value,
             port: port_value,

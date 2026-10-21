@@ -37,13 +37,17 @@ Once you focus Output to review it, the client preserves the cursor and selectio
 when appending messages and adjusts them when inserting history or removing old
 lines. Each tab retains at most 10,000 output lines.
 
-Open Server, Ignore to hide messages from a nickname or channel. Type one name
-and choose Add, or check "Ignore this channel: #name" for an open channel.
-Channel boxes start unchecked; saved ignores appear checked when reopened.
-The Ignored names list includes both people and channels. Remove a selected
-entry or uncheck its channel to receive messages again. OK saves the list in
-`irctest.toml`; Cancel discards edits. A name still in the field is added by OK.
-Matches use exact IRC names, ignoring capitalization, on every network.
+Open Server, Ignore to hide messages from a nickname or channel. Choose a
+server in the combo box before the name field, type one name, and choose Add.
+The current conversation's server is selected initially. Only that server's
+ignored names are listed. Each name has an unchecked removal checkbox; check
+one or more names and press Remove ignore to receive their messages again.
+Checking a name alone does not remove it. OK saves changes in `irctest.toml`;
+Cancel discards edits. A name still in the field is added to the selected server
+by OK. Matches use exact IRC names, ignoring capitalization, on that server.
+Previously saved global ignores are copied into each existing server's list
+when loaded; new servers start with no ignores. Discovered bouncer networks
+use the list of their configured server.
 Ignored text, notices and actions are hidden and silent, including newly
 retrieved history. Lines already displayed remain. Ignoring a channel leaves
 you joined to it. Sending to an ignored person or channel is also blocked,
@@ -327,10 +331,11 @@ wire framing, readable replies, usage help, quiet display and single display
 with and without `echo-message`.
 The names regression checks current-channel display and speech, membership
 updates, argument rejection, and that `/names` never sends a network request.
-The ignore regression checks keyboard controls, unchecked channel defaults,
-nickname/channel filtering for live messages and history, quiet ignored text,
-blocked outgoing commands and automatic replies, cancel, persistence across
-restart, and sending and receiving messages again after removal.
+The ignore regression checks the server selector, keyboard controls, batch
+removal, server-specific filtering for live messages and history, quiet ignored
+text, blocked outgoing commands and automatic replies, cancel, connected-server
+renaming, persistence across restart, and sending and receiving messages again
+after removal.
 
 On Linux, the existing packaging task builds a release AppImage:
 
