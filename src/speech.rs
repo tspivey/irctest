@@ -83,6 +83,19 @@ impl Speech {
         }
     }
 
+    /// F4: cuts off whatever is being said. Some backends (e.g. Speech Dispatcher) don't stop
+    /// when Ctrl is pressed the way a screen reader does.
+    pub fn stop(&mut self) {
+        if std::env::var_os("IRCTEST_SPEECH_LOG").is_some() {
+            println!("SPEAK STOP");
+            return;
+        }
+        if let Some(backend) = &self.backend {
+            // Errors just mean nothing was being said or the backend can't stop.
+            let _ = backend.stop();
+        }
+    }
+
     /// Speaks a message if `enabled`, queued behind anything already being said.
     pub fn message(&mut self, text: &str) {
         if self.enabled {

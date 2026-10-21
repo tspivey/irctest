@@ -23,7 +23,9 @@ control connection and each discovered network have their own server tabs in
 this same strip. Ctrl+F4 closes a conversation, parting a channel if necessary.
 Server tabs remain open; use Server, Disconnect or `/quit` to disconnect.
 
-F5 toggles speech for the current tab. Shift+F5 toggles all speech. New
+F4 stops whatever is being spoken, for speech backends such as Speech
+Dispatcher that don't stop when Ctrl is pressed. F5 toggles speech for the
+current tab. Shift+F5 toggles all speech. New
 conversation tabs start with speech enabled. With global speech enabled,
 mentions can still be announced when that tab's speech is off. The client
 starts each output cursor at the bottom, including restored startup history.

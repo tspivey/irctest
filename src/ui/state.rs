@@ -809,6 +809,11 @@ impl State {
         }
     }
 
+    /// F4: silences speech in progress.
+    pub fn stop_speech(&mut self) {
+        self.speech.stop();
+    }
+
     /// Speaks the result of a toggle, cutting off anything queued. Without speech, it's
     /// written to the tab instead so there's still some feedback.
     fn feedback(&mut self, s: usize, t: usize, text: &str) {

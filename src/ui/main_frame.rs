@@ -25,6 +25,7 @@ const ID_NEXT_TAB: i32 = 1104;
 const ID_PREVIOUS_TAB: i32 = 1105;
 const ID_NEXT_NETWORK: i32 = 1106;
 const ID_PREVIOUS_NETWORK: i32 = 1107;
+const ID_STOP_SPEECH: i32 = 1108;
 
 thread_local! {
     /// Drains network events on the GUI thread. Set once by `MainFrame::new`.
@@ -192,6 +193,11 @@ impl MainFrame {
             )
             .append_separator()
             .append_item(
+                ID_STOP_SPEECH,
+                "S&top speaking\tF4",
+                "Silence whatever is being spoken now",
+            )
+            .append_item(
                 ID_TOGGLE_SPEECH,
                 "Toggle &speech for this tab\tF5",
                 "Turn speech on or off for the current tab",
@@ -288,6 +294,7 @@ impl MainFrame {
                     frame.close(true);
                 }
                 ID_ABOUT => message(&frame, "irctest: an accessible IRC client."),
+                ID_STOP_SPEECH => state.borrow_mut().stop_speech(),
                 ID_TOGGLE_SPEECH => state.borrow_mut().toggle_tab_speech(),
                 ID_TOGGLE_ALL_SPEECH => state.borrow_mut().toggle_all_speech(),
                 ID_NEXT_TAB => state.borrow().navigate_tab(true),
