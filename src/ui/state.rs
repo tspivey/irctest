@@ -839,6 +839,40 @@ impl State {
 
     // ---- tabs ----------------------------------------------------------------------------
 
+    /// Cycle all tabs, including conversations on other servers and soju children.
+    pub fn navigate_tab(&self, forward: bool) {
+        let count: usize = self.servers.iter().map(|server| server.tabs.len()).sum();
+        let Some((s, t)) = self.current_tab() else {
+            return;
+        };
+        let page = self.page_index(s, t);
+        let next = if forward {
+            (page + 1) % count
+        } else {
+            (page + count - 1) % count
+        };
+        if let Some((s, t)) = self.page_to_tab(next) {
+            self.select_tab(s, t);
+        }
+    }
+
+    /// Skip conversations and land on the next server/account/network's server tab.
+    pub fn navigate_network(&self, forward: bool) {
+        let Some((s, _)) = self.current_tab() else {
+            return;
+        };
+        let count = self.servers.len();
+        if count < 2 {
+            return;
+        }
+        let next = if forward {
+            (s + 1) % count
+        } else {
+            (s + count - 1) % count
+        };
+        self.select_tab(next, 0);
+    }
+
     /// Notebook page index of a server's tab.
     fn page_index(&self, s: usize, t: usize) -> usize {
         self.servers[..s]

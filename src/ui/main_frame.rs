@@ -21,6 +21,10 @@ const ID_RECONNECT: i32 = 1003;
 const ID_CLOSE_TAB: i32 = 1103;
 const ID_TOGGLE_SPEECH: i32 = 1101;
 const ID_TOGGLE_ALL_SPEECH: i32 = 1102;
+const ID_NEXT_TAB: i32 = 1104;
+const ID_PREVIOUS_TAB: i32 = 1105;
+const ID_NEXT_NETWORK: i32 = 1106;
+const ID_PREVIOUS_NETWORK: i32 = 1107;
 
 thread_local! {
     /// Drains network events on the GUI thread. Set once by `MainFrame::new`.
@@ -129,6 +133,7 @@ impl MainFrame {
         let main = Self { frame, state };
         main.build_menus();
         main.bind_menu_events();
+        main.bind_navigation();
         main
     }
 
@@ -169,6 +174,23 @@ impl MainFrame {
             .build();
 
         let view_menu = Menu::builder()
+            .append_item(ID_NEXT_TAB, "&Next tab\tCtrl+Tab", "Select the next tab")
+            .append_item(
+                ID_PREVIOUS_TAB,
+                "&Previous tab\tCtrl+Shift+Tab",
+                "Select the previous tab",
+            )
+            .append_item(
+                ID_NEXT_NETWORK,
+                "Next netw&ork\tCtrl+PageDown",
+                "Select the next server, account or network",
+            )
+            .append_item(
+                ID_PREVIOUS_NETWORK,
+                "Previous net&work\tCtrl+PageUp",
+                "Select the previous server, account or network",
+            )
+            .append_separator()
             .append_item(
                 ID_TOGGLE_SPEECH,
                 "Toggle &speech for this tab\tF5",
@@ -268,8 +290,40 @@ impl MainFrame {
                 ID_ABOUT => message(&frame, "irctest: an accessible IRC client."),
                 ID_TOGGLE_SPEECH => state.borrow_mut().toggle_tab_speech(),
                 ID_TOGGLE_ALL_SPEECH => state.borrow_mut().toggle_all_speech(),
+                ID_NEXT_TAB => state.borrow().navigate_tab(true),
+                ID_PREVIOUS_TAB => state.borrow().navigate_tab(false),
+                ID_NEXT_NETWORK => state.borrow().navigate_network(true),
+                ID_PREVIOUS_NETWORK => state.borrow().navigate_network(false),
                 _ => event.skip(true),
             });
+    }
+
+    fn bind_navigation(&self) {
+        let state = self.state.clone();
+        // Catch these before the focused edit control or native notebook handles
+        // them. GTK's default Ctrl+Tab can focus the strip without changing pages.
+        self.frame.on_char_hook(move |event| {
+            if let WindowEventData::Keyboard(key) = &event {
+                if key.control_down() && !key.alt_down() {
+                    match key.get_key_code() {
+                        Some(WXK_TAB) => {
+                            event.skip(false);
+                            state.borrow().navigate_tab(!key.shift_down());
+                            return;
+                        }
+                        Some(WXK_PAGEDOWN | WXK_PAGEUP) if !key.shift_down() => {
+                            event.skip(false);
+                            state
+                                .borrow()
+                                .navigate_network(key.get_key_code() == Some(WXK_PAGEDOWN));
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            event.skip(true);
+        });
     }
 }
 

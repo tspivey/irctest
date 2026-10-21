@@ -13,9 +13,15 @@ real name, and logging option. Each server can override the nickname and connect
 automatically at startup.
 
 Every tab has a Message input and a read-only Output control. Enter sends input;
-Up and Down recall previous input. Tab moves between controls. Ctrl+Tab changes
-tabs, and Ctrl+F4 closes a conversation, parting a channel if necessary. Server
-tabs remain open; use Server, Disconnect or `/quit` to disconnect.
+Up and Down recall previous input. Tab moves between controls. Ctrl+Tab selects
+the next tab; Ctrl+Shift+Tab selects the previous tab, wrapping through all
+servers, networks, channels and private conversations. Ctrl+PageDown and
+Ctrl+PageUp jump to the next or previous server/account/network tab, skipping
+its conversations. These actions are also in the View menu and focus the
+destination's Message input, preserving any unsent draft. A soju account's
+control connection and each discovered network have their own server tabs in
+this same strip. Ctrl+F4 closes a conversation, parting a channel if necessary.
+Server tabs remain open; use Server, Disconnect or `/quit` to disconnect.
 
 F5 toggles speech for the current tab. Shift+F5 toggles all speech. New
 conversation tabs start with speech enabled. With global speech enabled,
@@ -247,6 +253,15 @@ cargo test --locked --lib read_marker::
 cargo test --locked --lib sync_state::
 ```
 
+The Linux native navigation regression uses an isolated virtual display,
+temporary configuration and logged speech. It requires Python GObject with
+AT-SPI bindings, xdotool, D-Bus and Xvfb, and does not use a real IRC account:
+
+```sh
+cargo build --locked
+dbus-run-session -- xvfb-run -a python3 tests/gui_navigation.py
+```
+
 On Linux, the existing packaging task builds a release AppImage:
 
 ```sh
@@ -257,8 +272,9 @@ Its output is `target/release/irctest-<version>-<architecture>.AppImage`. It
 bundles resolved application libraries while leaving system libraries such as
 glibc and graphics drivers on the host.
 
-Automated tests exercise models and fake in-memory IRC sessions. They do not
-establish live or native accessibility acceptance for this change. Live soju
+Automated tests exercise models, fake in-memory IRC sessions and native GTK
+tab/network keyboard navigation with focus and draft preservation. They do not
+establish live soju or screen-reader acceptance for this change. Live soju
 login with two networks, rename/removal, reconnect with missed messages, and
 marker synchronization from a second device remain unperformed. Audible speech,
 screen-reader review, keyboard/focus behavior during history insertion, and
