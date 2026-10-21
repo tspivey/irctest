@@ -1536,6 +1536,18 @@ impl State {
                         self.child_actions(parent, actions);
                         continue;
                     }
+                    // Queued children start after the discovery update has already
+                    // refreshed labels. Give each child its name when it starts too.
+                    let label = single_line(&format!(
+                        "{} / {} [{}]",
+                        self.servers[parent].config.name,
+                        self.servers[parent]
+                            .group
+                            .network(&id)
+                            .map(|network| network.name())
+                            .unwrap_or(&id),
+                        id
+                    ));
                     let c = existing.unwrap_or_else(|| {
                         let config = self.servers[parent].config.clone();
                         let c = self.add_server(config, false);
@@ -1544,6 +1556,8 @@ impl State {
                         self.servers[c].actual_network = Some(id.clone());
                         c
                     });
+                    self.servers[c].tabs[0].name = label.clone();
+                    set_page_text(&self.notebook, self.page_index(c, 0), &label);
                     self.servers[c].config = self.servers[parent].config.clone();
                     self.servers[c].config.discover_networks = false;
                     self.servers[c].accepted_fingerprints =
@@ -1953,6 +1967,7 @@ impl State {
             NetEvent::Message(msg) => self.handle_message(s, &msg),
             NetEvent::NickChanged(nick) => self.servers[s].nick = nick,
             NetEvent::Error(e) => self.line(s, 0, &format!("Error: {e}")),
+            NetEvent::Notice(text) => self.line(s, 0, &text),
             // Needs a dialog, which the caller shows: see `certificate_prompt`.
             NetEvent::UntrustedCertificate(prompt) => prompt.answer(false),
             NetEvent::Disconnected { reason, retry } => {

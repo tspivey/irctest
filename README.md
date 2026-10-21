@@ -83,6 +83,8 @@ connect_commands = []
 Automatic discovery requires configured SASL PLAIN credentials and advertised
 bouncer capabilities. `discover_networks` defaults to true; clear Discover
 bouncer networks in the server editor, or set it to false, to opt out.
+An unbound bouncer login without SASL now explains why no network sessions were opened and points to the SASL fields and reconnect action.
+
 PASS-only logins keep their existing manual network behavior and do not enable
 automatic discovery. Existing network-qualified login configurations also
 remain usable: a connection reported as bound through `BOUNCER_NETID` does not
@@ -260,7 +262,11 @@ AT-SPI bindings, xdotool, D-Bus and Xvfb, and does not use a real IRC account:
 ```sh
 cargo build --locked
 dbus-run-session -- xvfb-run -a python3 tests/gui_navigation.py
+dbus-run-session -- xvfb-run -a python3 tests/gui_soju_networks.py
 ```
+
+The soju regression uses a local fake bouncer with five networks to check that
+children started from the connection queue also receive their network labels.
 
 On Linux, the existing packaging task builds a release AppImage:
 
@@ -273,10 +279,11 @@ bundles resolved application libraries while leaving system libraries such as
 glibc and graphics drivers on the host.
 
 Automated tests exercise models, fake in-memory IRC sessions and native GTK
-tab/network keyboard navigation with focus and draft preservation. They do not
-establish live soju or screen-reader acceptance for this change. Live soju
-login with two networks, rename/removal, reconnect with missed messages, and
-marker synchronization from a second device remain unperformed. Audible speech,
+tab/network keyboard navigation with focus and draft preservation. Live soju
+SASL login, discovery of five networks, their labels, and restored channel tabs
+were verified on Linux on 2026-10-21. Network rename/removal, reconnect with
+missed messages, and marker synchronization from a second device remain
+unperformed. Audible speech,
 screen-reader review, keyboard/focus behavior during history insertion, and
 Windows native selection/cursor behavior with Unicode also remain unperformed.
 

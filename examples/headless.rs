@@ -71,6 +71,7 @@ fn main() {
         ),
         NetEvent::NickChanged(nick) => println!("[{id}] our nick is now {nick}"),
         NetEvent::Error(e) => println!("[{id}] error: {e}"),
+        NetEvent::Notice(text) => println!("[{id}] {text}"),
         NetEvent::UntrustedCertificate(prompt) => {
             let what = if prompt.changed {
                 "changed"

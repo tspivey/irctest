@@ -76,6 +76,8 @@ pub enum NetEvent {
     NickChanged(String),
     /// Something went wrong but the connection is still up (e.g. an unparseable line).
     Error(String),
+    /// An actionable connection status that is not a failed connection.
+    Notice(String),
     /// The server's TLS certificate isn't trusted by Windows or by fingerprint. The connection
     /// waits, without registering, until the prompt is answered.
     UntrustedCertificate(CertificatePrompt),
@@ -1053,6 +1055,13 @@ impl Connection {
         };
         self.role = Some(role.clone());
         self.event(NetEvent::Role(role.clone()));
+        if role == ConnectionRole::Direct
+            && self.reg.discover_networks
+            && self.reg.sasl_password.is_empty()
+            && self.negotiation.offered("soju.im/bouncer-networks")
+        {
+            self.event(NetEvent::Notice("Connected to the bouncer account, but no network sessions were opened. Automatic network connections require a SASL username and password. Set them in Server, Manage servers, Edit, then reconnect.".into()));
+        }
         if role == ConnectionRole::Control {
             if self.snapshot_complete {
                 self.event(NetEvent::NetworkSnapshot(
@@ -1742,6 +1751,51 @@ mod tests {
         fake.send(":s 005 tyler BOUNCER_NETID=43 :supported").await;
         let (reason, retry) = fake.session.await.unwrap();
         assert!(!retry && reason.contains("different network"));
+    }
+
+    #[tokio::test]
+    async fn pass_only_bouncer_explains_missing_network_sessions_once() {
+        for (discover, bound, offered, expected) in [
+            (true, false, true, true),
+            (true, true, true, false),
+            (false, false, true, false),
+            (true, false, false, false),
+        ] {
+            let mut fake = Fake::start_with(Registration {
+                password: "test-server-password".into(),
+                discover_networks: discover,
+                ..test_reg()
+            });
+            while !fake.recv().await.starts_with("USER") {}
+            fake.send(if offered {
+                "CAP * LS :sasl=PLAIN soju.im/bouncer-networks"
+            } else {
+                "CAP * LS :"
+            })
+            .await;
+            assert_eq!(fake.recv().await, "CAP END");
+            fake.send(":soju 001 tyler :Welcome to soju").await;
+            if bound {
+                fake.send(":soju 005 tyler BOUNCER_NETID=42 :supported")
+                    .await;
+            }
+            fake.send(":soju 376 tyler :End MOTD").await;
+            fake.send(":soju 376 tyler :Repeated end MOTD").await;
+            fake.send("PING :fence").await;
+            assert_eq!(fake.recv().await, "PONG fence");
+            let mut notices = Vec::new();
+            while let Ok(event) = fake.events.try_recv() {
+                if let NetEvent::Notice(text) = event {
+                    notices.push(text);
+                }
+            }
+            assert_eq!(notices.len(), usize::from(expected));
+            if expected {
+                assert!(notices[0].contains("Connected to the bouncer account"));
+                assert!(notices[0].contains("SASL username and password"));
+                assert!(!notices[0].contains("test-server-password"));
+            }
+        }
     }
 
     #[tokio::test]

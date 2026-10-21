@@ -343,6 +343,11 @@ impl Negotiation {
     pub fn enabled(&self) -> &Capabilities {
         &self.enabled
     }
+    /// Whether the server advertises a capability, including those not requested.
+    pub fn offered(&self, name: &str) -> bool {
+        self.offered.contains_key(name)
+    }
+
     pub fn unfinished(&self) -> bool {
         !self.ready
     }
