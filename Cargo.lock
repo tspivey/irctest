@@ -290,7 +290,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1138,7 +1138,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1442,7 +1442,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1815,7 +1815,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2030,8 +2030,8 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "wxdragon"
-version = "0.9.22"
-source = "git+https://github.com/AllenDang/wxDragon#e32baf6060b9ad6fde8cda1a1bc5449d16039cbe"
+version = "0.9.23"
+source = "git+https://github.com/AllenDang/wxDragon#f046ca52f0b486727012eb1712ee3a70b088c261"
 dependencies = [
  "bitflags",
  "log",
@@ -2042,8 +2042,8 @@ dependencies = [
 
 [[package]]
 name = "wxdragon-macros"
-version = "0.9.22"
-source = "git+https://github.com/AllenDang/wxDragon#e32baf6060b9ad6fde8cda1a1bc5449d16039cbe"
+version = "0.9.23"
+source = "git+https://github.com/AllenDang/wxDragon#f046ca52f0b486727012eb1712ee3a70b088c261"
 dependencies = [
  "proc-macro2",
  "quick-xml",
@@ -2053,8 +2053,8 @@ dependencies = [
 
 [[package]]
 name = "wxdragon-sys"
-version = "0.9.22"
-source = "git+https://github.com/AllenDang/wxDragon#e32baf6060b9ad6fde8cda1a1bc5449d16039cbe"
+version = "0.9.23"
+source = "git+https://github.com/AllenDang/wxDragon#f046ca52f0b486727012eb1712ee3a70b088c261"
 dependencies = [
  "bindgen",
  "cmake",

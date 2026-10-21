@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Tab nick completion and F6 focus switching against a local fake server."""
+"""Check Tab nick completion, F6 and Shift+Tab focus switching against a local fake server."""
 import os
 from pathlib import Path
 import socketserver
@@ -158,14 +158,17 @@ auto_connect = true
                 expect("zz m")
                 assert len(spoken()) == before, spoken()
 
-                # F6 moves between Message and Output; Shift+Tab still leaves Message.
+                # F6 moves between Message and Output; Shift+Tab goes back to the tabs.
                 key("F6")
                 wait_for(lambda: focused(False), "F6 did not reach Output")
                 key("F6")
                 wait_for(lambda: focused(True), "F6 did not return to Message")
                 key("shift+Tab")
-                wait_for(lambda: focused(False), "Shift+Tab did not reach Output")
-                print("PASS: nick completion order, cycling, suffixes, no-match, and F6 focus")
+                wait_for(lambda: any(n.get_role() in (Atspi.Role.PAGE_TAB_LIST, Atspi.Role.PAGE_TAB)
+                                     and n.get_state_set().contains(Atspi.StateType.FOCUSED)
+                                     for n in nodes()),
+                         "Shift+Tab did not reach the tabs")
+                print("PASS: nick completion order, cycling, suffixes, no-match, F6 and Shift+Tab focus")
             finally:
                 client.terminate()
                 client.wait(timeout=5)
