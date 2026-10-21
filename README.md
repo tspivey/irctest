@@ -133,6 +133,11 @@ Network rename/removal notifications update the existing tabs without selecting
 them. Network administration remains available through raw IRC commands and
 BouncerServ; there is no graphical bouncer administration interface.
 
+The client sends keepalives every 30 seconds after capability negotiation.
+If a probe gets no reply, it retries at 20-second intervals and reconnects
+only after three unanswered probes. Any incoming traffic clears that pending
+timeout, so a single missed keepalive does not immediately interrupt a session.
+
 ## Commands
 
 Plain text sends a message to the current conversation. Begin with `//` to send

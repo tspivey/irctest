@@ -184,9 +184,10 @@ impl Sender {
     }
 }
 
-/// How often we PING the server, and how long we wait for any reply before giving up.
-const PING_INTERVAL: Duration = Duration::from_secs(180);
+/// Keep idle sessions active, and allow brief missed probes before reconnecting.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PING_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_UNANSWERED_PINGS: u8 = 3;
 /// Longer physical lines are discarded through their terminating newline.
 /// IRCv3 allows 8191 bytes of tags plus 512 for the rest.
 const MAX_LINE: usize = 16 * 1024;
@@ -559,6 +560,7 @@ impl Connection {
         let mut ping = interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
         // Set when we PING; any line from the server clears it.
         let mut deadline: Option<Instant> = None;
+        let mut unanswered_pings = 0;
         // Kept across loop turns: a read cancelled by the other branches leaves its bytes here.
         let mut line = Vec::new();
         let mut discarding = false;
@@ -594,6 +596,7 @@ impl Connection {
                         Err(e) => return (describe(&e), true),
                     }
                     deadline = None;
+                    unanswered_pings = 0;
                     let complete = line.ends_with(b"\n");
                     if discarding {
                         if complete { discarding = false; }
@@ -625,11 +628,20 @@ impl Connection {
                 _ = role_timeout => self.decide_role(),
                 _ = negotiation_timeout => return ("Capability negotiation or authentication timed out after 30 seconds.".into(), true),
                 _ = ping.tick() => {
-                    self.send(Command::PING(chrono::Utc::now().timestamp().to_string(), None));
-                    deadline.get_or_insert(Instant::now() + PING_TIMEOUT);
+                    // An outstanding probe owns its timeout and retry budget.
+                    if deadline.is_none() && self.negotiation_deadline.is_none() {
+                        self.send(Command::PING(chrono::Utc::now().timestamp().to_string(), None));
+                        unanswered_pings = 1;
+                        deadline = Some(Instant::now() + PING_TIMEOUT);
+                    }
                 }
                 _ = timeout => {
-                    return (format!("No reply from the server in {} seconds.", PING_TIMEOUT.as_secs()), true);
+                    if unanswered_pings >= MAX_UNANSWERED_PINGS {
+                        return (format!("No reply from the server after {MAX_UNANSWERED_PINGS} keepalive probes."), true);
+                    }
+                    self.send(Command::PING(chrono::Utc::now().timestamp().to_string(), None));
+                    unanswered_pings += 1;
+                    deadline = Some(Instant::now() + PING_TIMEOUT);
                 }
             }
         }
@@ -2290,6 +2302,37 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn keepalive_preserves_connections_with_a_short_idle_limit() {
+        let mut fake = Fake::registered("", &[]).await;
+        // A silent middlebox can discard an idle TCP session before three minutes.
+        // The peer must receive traffic inside its 45-second idle window.
+        for _ in 0..4 {
+            let ping = tokio::time::timeout(Duration::from_secs(45), fake.recv())
+                .await
+                .expect("connection expired before the client sent a keepalive");
+            let token = ping.strip_prefix("PING ").expect("expected keepalive PING");
+            fake.send(&format!(":s PONG s :{token}")).await;
+        }
+        assert!(!fake.session.is_finished());
+        fake.session.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_missed_keepalive_is_retried_without_reconnecting() {
+        let mut fake = Fake::registered("", &[]).await;
+        assert!(fake.recv().await.starts_with("PING "));
+        // Ignore the first probe, then answer the retry on this same connection.
+        let retry = tokio::time::timeout(Duration::from_secs(45), fake.recv())
+            .await
+            .expect("client did not retry the keepalive");
+        let token = retry.strip_prefix("PING ").expect("expected a retry PING");
+        fake.send(&format!(":s PONG s :{token}")).await;
+        assert!(fake.recv().await.starts_with("PING "));
+        assert!(!fake.session.is_finished());
+        fake.session.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pings_and_times_out() {
         let mut fake = Fake::registered("", &[]).await;
         let start = Instant::now();
@@ -2299,10 +2342,21 @@ mod tests {
         fake.send(":irc.test NOTICE tyler :hi").await;
         assert!(fake.recv().await.starts_with("PING "));
         assert_eq!(start.elapsed(), PING_INTERVAL * 2);
+        // A completely silent peer still gets only a bounded number of retries.
+        for attempt in 1..MAX_UNANSWERED_PINGS {
+            assert!(fake.recv().await.starts_with("PING "));
+            assert_eq!(
+                start.elapsed(),
+                PING_INTERVAL * 2 + PING_TIMEOUT * attempt as u32
+            );
+        }
         let (reason, retry) = fake.session.await.unwrap();
-        assert_eq!(reason, "No reply from the server in 20 seconds.");
+        assert_eq!(reason, "No reply from the server after 3 keepalive probes.");
         assert!(retry);
-        assert_eq!(start.elapsed(), PING_INTERVAL * 2 + PING_TIMEOUT);
+        assert_eq!(
+            start.elapsed(),
+            PING_INTERVAL * 2 + PING_TIMEOUT * MAX_UNANSWERED_PINGS as u32
+        );
     }
 
     /// A local TLS server with the self-signed certificate in `testdata` (RSA: Windows won't

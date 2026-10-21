@@ -50,7 +50,7 @@ src/
 - Registration: `CAP LS 302`, `PASS` (when configured), `NICK`, `USER`, followed by the negotiated CAP/SASL barrier. Discovered soju children authenticate and send BIND before CAP END.
 - Nick in use or invalid (`433`/`432`) before `001`: tries `nick_`, `nick__`, `nick___` in turn, then gives up with "Every nickname is in use." (no retry). After registration the user picks their own nick.
 - Tracks our nick: from `001`'s first parameter and from `NICK` messages whose source is us. `NickChanged` is sent after the message that caused it, so the GUI routes that message with the old nick.
-- Answers server `PING`s. PINGs the server every 180 s; if no line at all arrives within 20 s after that, the connection is dropped.
+- Answers server `PING`s. Sends a keepalive every 30 s after capability negotiation, retrying an unanswered probe every 20 s. Any incoming line clears the pending probes; three unanswered probes end the connection and allow automatic reconnect.
 - CTCP replies to `VERSION`, `PING`, `TIME`, `CLIENTINFO` (as `NOTICE`s to the sender, never to our own messages).
 - `connect_commands` are sent when `001` arrives.
 - Lines are read as bytes and decoded lossily, so invalid UTF-8 becomes `\u{FFFD}`; a line that fails to parse is reported as `NetEvent::Error` and the connection carries on. Physical lines over 16 KiB are discarded through the next newline so a remainder cannot become live traffic. Outgoing messages are cut at any CR/LF so a message can't carry a second command.

@@ -101,7 +101,15 @@ impl Peer {
 
     async fn fence(&mut self, token: &str) {
         self.send(&format!("PING :{token}")).await;
-        self.expect(&format!("PONG {token}")).await;
+        loop {
+            let line = self.line().await;
+            if let Some(probe) = line.strip_prefix("PING ") {
+                self.send(&format!("PONG :{probe}")).await;
+            } else {
+                assert_eq!(line, format!("PONG {token}"));
+                break;
+            }
+        }
     }
 
     fn events(&mut self) -> Vec<NetEvent> {
