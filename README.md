@@ -13,7 +13,11 @@ real name, and logging option. Each server can override the nickname and connect
 automatically at startup.
 
 Every tab has a Message input and a read-only Output control. Enter sends input;
-Up and Down recall previous input. Tab moves between controls. Ctrl+Tab selects
+Up and Down recall previous input. Tab completes the nickname before the cursor,
+speaking it; press Tab again to cycle through other matches, most recent
+speakers first. A completion at the start of the line is followed by ": ",
+otherwise by a space. If nothing matches, Tab beeps. F6 moves between Message
+and Output, as does Shift+Tab from Message. Ctrl+Tab selects
 the next tab; Ctrl+Shift+Tab selects the previous tab, wrapping through all
 servers, networks, channels and private conversations. Ctrl+PageDown and
 Ctrl+PageUp jump to the next or previous server/account/network tab, skipping

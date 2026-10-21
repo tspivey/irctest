@@ -26,6 +26,7 @@ const ID_PREVIOUS_TAB: i32 = 1105;
 const ID_NEXT_NETWORK: i32 = 1106;
 const ID_PREVIOUS_NETWORK: i32 = 1107;
 const ID_STOP_SPEECH: i32 = 1108;
+const ID_SWITCH_PANE: i32 = 1109;
 
 thread_local! {
     /// Drains network events on the GUI thread. Set once by `MainFrame::new`.
@@ -191,6 +192,11 @@ impl MainFrame {
                 "Previous net&work\tCtrl+PageUp",
                 "Select the previous server, account or network",
             )
+            .append_item(
+                ID_SWITCH_PANE,
+                "Switch &focus between Message and Output\tF6",
+                "Move focus between this tab's Message input and Output",
+            )
             .append_separator()
             .append_item(
                 ID_STOP_SPEECH,
@@ -295,6 +301,7 @@ impl MainFrame {
                 }
                 ID_ABOUT => message(&frame, "irctest: an accessible IRC client."),
                 ID_STOP_SPEECH => state.borrow_mut().stop_speech(),
+                ID_SWITCH_PANE => state.borrow().switch_pane(),
                 ID_TOGGLE_SPEECH => state.borrow_mut().toggle_tab_speech(),
                 ID_TOGGLE_ALL_SPEECH => state.borrow_mut().toggle_all_speech(),
                 ID_NEXT_TAB => state.borrow().navigate_tab(true),

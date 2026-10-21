@@ -3,6 +3,7 @@
 pub mod bouncer;
 pub mod cap;
 pub mod commands;
+pub mod complete;
 pub mod config;
 pub mod connections;
 pub mod format;

@@ -6,6 +6,7 @@ use std::rc::{Rc, Weak};
 
 use chrono::{DateTime, Local};
 use irc_proto::{ChannelExt, ChannelMode, Command, Message, Mode, Prefix, Response};
+use irctest::complete::{Completion, order};
 use irctest::commands::{Input, join_lines, parse_input, parse_join};
 use irctest::config::{Config, ServerConfig};
 use irctest::format::{
@@ -50,8 +51,14 @@ pub struct ChatTab {
     rejoin: bool,
     /// Channels: the key we joined with, or the one set since (+k). Kept for rejoining; never saved.
     key: Option<String>,
-    /// Channels: who's in it, as `irc_lower` nicks. Used to route QUIT and NICK.
-    nicks: HashSet<String>,
+    /// Channels: who's in it, as `irc_lower` nick → nick. Used to route QUIT and NICK, and
+    /// for completion.
+    nicks: HashMap<String, String>,
+    /// Channels: when each `irc_lower` nick last spoke, so completion offers them first.
+    spoke: HashMap<String, DateTime<Local>>,
+    /// The Tab completion in progress, with the input value and cursor it left, so a
+    /// following Tab knows to cycle rather than start again.
+    completion: Option<(Completion, String, i64)>,
     /// Lines typed into this tab, for Up/Down.
     history: History,
     deduper: Deduper,
@@ -952,7 +959,9 @@ impl State {
                 joined: false,
                 rejoin: false,
                 key: None,
-                nicks: HashSet::new(),
+                nicks: HashMap::new(),
+                spoke: HashMap::new(),
+                completion: None,
                 history: History::default(),
                 deduper: Deduper::new(&[]),
                 oldest: None,
@@ -1121,6 +1130,67 @@ impl State {
         let Some(text) = recalled else { return };
         tab.tab.input.set_value(&text);
         tab.tab.input.set_insertion_point_end();
+    }
+
+    /// Tab in the Message input: completes the nick before the cursor, or the next match if
+    /// the last Tab completed one. Beeps if there's nothing to complete.
+    fn complete(&mut self, id: TabId) {
+        let Some((s, t)) = self.locate(id) else {
+            return;
+        };
+        let me = irc_lower(&self.servers[s].nick);
+        let tab = &mut self.servers[s].tabs[t];
+        let input = tab.tab.input;
+        let value = input.get_value();
+        let point = input.get_insertion_point();
+        let cycling = tab
+            .completion
+            .take()
+            .filter(|(_, text, at)| *text == value && *at == point);
+        let completion = match cycling {
+            Some((mut completion, _, _)) => {
+                completion.next();
+                Some(completion)
+            }
+            None => {
+                let nicks = match tab.kind {
+                    TabKind::Server => Vec::new(),
+                    TabKind::Query => vec![tab.name.clone()],
+                    TabKind::Channel => order(
+                        tab.nicks
+                            .iter()
+                            .filter(|(lower, _)| **lower != me)
+                            .map(|(_, nick)| nick.clone()),
+                        |lower| tab.spoke.get(lower).copied(),
+                    ),
+                };
+                Completion::start(&value, byte_offset(&value, point), &nicks)
+            }
+        };
+        let Some(completion) = completion else {
+            bell();
+            return;
+        };
+        let (text, cursor) = completion.text();
+        input.change_value(&text);
+        let point = text_position(&text, cursor);
+        input.set_insertion_point(point);
+        let nick = completion.nick().to_string();
+        tab.completion = Some((completion, text, point));
+        self.speech.say(&nick, true);
+    }
+
+    /// F6: moves between the current tab's Message input and Output.
+    pub fn switch_pane(&self) {
+        let Some((s, t)) = self.current_tab() else {
+            return;
+        };
+        let tab = &self.servers[s].tabs[t].tab;
+        if tab.input.has_focus() {
+            tab.output.set_focus();
+        } else {
+            tab.input.set_focus();
+        }
     }
 
     fn page_to_tab(&self, mut page: usize) -> Option<(usize, usize)> {
@@ -1350,6 +1420,14 @@ impl State {
     fn observe_chat(&mut self, s: usize, t: usize, message: &Message) {
         if !displayed_chat(message) {
             return;
+        }
+        if let Some(source) = message.source_nickname() {
+            let time = message_time(message).unwrap_or_else(Local::now);
+            let spoke = self.servers[s].tabs[t]
+                .spoke
+                .entry(irc_lower(source))
+                .or_insert(time);
+            *spoke = (*spoke).max(time);
         }
         let target = self.servers[s].tabs[t].name.clone();
         self.servers[s].markers.observe(&target, message);
@@ -2281,7 +2359,7 @@ impl State {
                     .iter()
                     .enumerate()
                     .filter(|(_, tab)| match tab.kind {
-                        TabKind::Channel => tab.nicks.contains(&key),
+                        TabKind::Channel => tab.nicks.contains_key(&key),
                         TabKind::Query => irc_eq(&tab.name, &nick),
                         TabKind::Server => false,
                     })
@@ -2309,7 +2387,7 @@ impl State {
                             tab.key = Some(key);
                         }
                     }
-                    tab.nicks.insert(irc_lower(source));
+                    tab.nicks.insert(irc_lower(source), source.to_string());
                 }
             }
             Command::PART(channel, _) => self.left(s, channel, source, is_me(source)),
@@ -2329,10 +2407,13 @@ impl State {
                         }
                     }
                 }
-                let (old, new) = (irc_lower(source), irc_lower(new));
+                let (old, lower) = (irc_lower(source), irc_lower(new));
                 for tab in &mut self.servers[s].tabs {
-                    if tab.nicks.remove(&old) {
-                        tab.nicks.insert(new.clone());
+                    if tab.nicks.remove(&old).is_some() {
+                        tab.nicks.insert(lower.clone(), new.clone());
+                    }
+                    if let Some(time) = tab.spoke.remove(&old) {
+                        tab.spoke.insert(lower.clone(), time);
                     }
                 }
             }
@@ -2360,7 +2441,7 @@ impl State {
                         let nick = name.trim_start_matches(['~', '&', '@', '%', '+', '!']);
                         let nick = nick.split('!').next().unwrap_or(nick);
                         if !nick.is_empty() {
-                            tab.nicks.insert(irc_lower(nick));
+                            tab.nicks.insert(irc_lower(nick), nick.to_string());
                         }
                     }
                 }
@@ -2620,12 +2701,36 @@ impl Drop for State {
     }
 }
 
-/// Wires a tab's input box: Enter to `State::handle_input`, Up/Down to `State::recall`.
+/// Wires a tab's input box: Enter to `State::handle_input`, Up/Down to `State::recall`, Tab
+/// to `State::complete`.
 /// The name a tab's log folder is made from.
 fn log_target(tab: &ChatTab) -> &str {
     match tab.kind {
         TabKind::Server => SERVER_TARGET,
         TabKind::Channel | TabKind::Query => &tab.name,
+    }
+}
+
+/// Converts a text control position (UTF-16 units on Windows, characters elsewhere) to a
+/// byte offset into `text`.
+fn byte_offset(text: &str, position: i64) -> usize {
+    let mut units = 0;
+    for (i, c) in text.char_indices() {
+        if units >= position {
+            return i;
+        }
+        units += if cfg!(windows) { c.len_utf16() } else { 1 } as i64;
+    }
+    text.len()
+}
+
+/// The inverse of [`byte_offset`].
+fn text_position(text: &str, offset: usize) -> i64 {
+    let head = &text[..offset];
+    if cfg!(windows) {
+        head.encode_utf16().count() as i64
+    } else {
+        head.chars().count() as i64
     }
 }
 
@@ -2635,6 +2740,16 @@ fn bind_input(state: Weak<RefCell<State>>, id: TabId, tab: &Tab) {
     tab.input.on_key_down(move |event| {
         if let WindowEventData::Keyboard(key) = &event {
             let plain = !key.control_down() && !key.shift_down() && !key.alt_down();
+            if key.get_key_code() == Some(WXK_TAB) && !key.control_down() && !key.alt_down() {
+                event.skip(false);
+                if key.shift_down() {
+                    // The control processes Tab itself, so move focus back by hand.
+                    input.navigate(false);
+                } else if let Some(state) = keys_state.upgrade() {
+                    state.borrow_mut().complete(id);
+                }
+                return;
+            }
             let up = match key.get_key_code() {
                 Some(WXK_UP) if plain => Some(true),
                 Some(WXK_DOWN) if plain => Some(false),

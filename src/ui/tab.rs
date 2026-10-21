@@ -24,7 +24,7 @@ impl Tab {
         // still puts Output on top).
         let input_label = StaticText::builder(&panel).with_label("Message").build();
         let input = TextCtrl::builder(&panel)
-            .with_style(TextCtrlStyle::ProcessEnter)
+            .with_style(TextCtrlStyle::ProcessEnter | TextCtrlStyle::ProcessTab)
             .build();
         let output_label = StaticText::builder(&panel).with_label("Output").build();
         let output = TextCtrl::builder(&panel)

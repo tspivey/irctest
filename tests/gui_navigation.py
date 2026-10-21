@@ -119,12 +119,12 @@ auto_connect = true
                 expect("account / Network Two")
                 key("ctrl+Page_Up")
                 expect("account / Network One")
-                # Plain Tab still reaches Output; navigation must work there too.
-                key("Tab")
+                # F6 reaches Output (Tab completes nicks); navigation must work there too.
+                key("F6")
                 wait_for(lambda: any(n.get_role() == Atspi.Role.TEXT
                                      and n.get_state_set().contains(Atspi.StateType.FOCUSED)
                                      and not n.get_state_set().contains(Atspi.StateType.EDITABLE)
-                                     for n in nodes()), "Tab did not reach Output")
+                                     for n in nodes()), "F6 did not reach Output")
                 key("ctrl+Tab")
                 expect("alice")
                 # Menu navigation uses the same actions as the keyboard shortcuts.
