@@ -330,7 +330,8 @@ dbus-run-session -- xvfb-run -a python3 tests/gui_ignore.py
 The soju regression uses a local fake bouncer with five networks to check that
 children started from the connection queue also receive their network labels.
 The history regression checks first login and restart, chronological order,
-duplicate suppression and quiet playback, with and without `message-tags`.
+duplicate suppression and quiet playback, with and without `message-tags`,
+including channels already marked read by a shared or saved read marker.
 The CTCP regression types requests through the native Message input and checks
 wire framing, readable replies, usage help, quiet display and single display
 with and without `echo-message`.

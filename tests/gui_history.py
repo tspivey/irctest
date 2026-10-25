@@ -7,8 +7,11 @@ import socketserver
 import subprocess
 import tempfile
 import threading
+import tomllib
 
 from gui_navigation import Atspi, BINARY, wait_for, walk
+
+READ_TIME = "2026-10-20T10:03:00.000Z"
 
 
 class Bouncer(socketserver.ThreadingTCPServer):
@@ -41,7 +44,7 @@ class Session(socketserver.StreamRequestHandler):
                 if command == "NICK":
                     nickname = arguments
                 elif line == "CAP LS 302":
-                    send("CAP * LS :batch server-time message-tags draft/chathistory")
+                    send("CAP * LS :batch server-time message-tags draft/chathistory draft/read-marker")
                 elif line.startswith("CAP REQ "):
                     send("CAP * ACK :" + arguments.removeprefix("REQ ").removeprefix(":"))
                 elif line == "CAP END":
@@ -50,8 +53,11 @@ class Session(socketserver.StreamRequestHandler):
                     if not self.server.message_tags:
                         send("CAP * DEL :message-tags")
                     send(f":soju 001 {nickname} :Welcome to soju",
-                         f":soju 005 {nickname} BOUNCER_NETID=42 CHATHISTORY=1000 MSGREFTYPES=timestamp :supported",
-                         f":soju 422 {nickname} :No MOTD",
+                         f":soju 005 {nickname} BOUNCER_NETID=42 CHATHISTORY=1000 MSGREFTYPES=timestamp :supported")
+                    # First login gets a shared marker; restart must restore the saved one.
+                    if self.server.already_read and registration == 1:
+                        send(f":soju MARKREAD #history timestamp={READ_TIME}")
+                    send(f":soju 422 {nickname} :No MOTD",
                          f":{nickname}!user@host JOIN #history",
                          f":soju 366 {nickname} #history :End of names")
                 elif command == "CHATHISTORY":
@@ -82,11 +88,12 @@ class Session(socketserver.StreamRequestHandler):
             return
 
 
-def run_case(message_tags, capped=False):
+def run_case(message_tags, capped=False, already_read=False):
     with Bouncer(("127.0.0.1", 0), Session) as bouncer, tempfile.TemporaryDirectory(prefix="irctest-history-gui-") as directory:
         bouncer.requests = []
         bouncer.message_tags = message_tags
         bouncer.capped = capped
+        bouncer.already_read = already_read
         bouncer.registrations = 0
         bouncer.next_message = 4
         bouncer.unexpected_context = threading.Event()
@@ -132,19 +139,29 @@ auto_connect = true
                             wait_for(restored, f"channel context missing on {'restart' if attempt else 'first login'}")
                         except AssertionError as error:
                             raise AssertionError(f"{error}; requests={bouncer.requests!r}") from error
+                        if already_read:
+                            wait_for(lambda: any(node.get_role() == Atspi.Role.PAGE_TAB
+                                                 and node.get_name() == "#history" for node in nodes()),
+                                     "restored channel should remain marked read")
                         if capped and attempt == 1:
                             assert not bouncer.unexpected_context.wait(timeout=0.5), "capped catch-up must keep its ordered context, not start a new LATEST across the remaining gap"
                         # Use the real shutdown path so synchronization state is flushed.
                         exit_action = next(node for node in nodes() if node.get_name() == "Exit")
                         assert Atspi.Action.do_action(exit_action, 0)
                         client.wait(timeout=5)
+                        if already_read:
+                            state = tomllib.loads(Path(directory, "irctest-state.toml").read_text())
+                            conversations = list(state["conversations"].values())
+                            assert len(conversations) == 1, conversations
+                            assert conversations[0]["read"] == READ_TIME, conversations
+                            assert conversations[0]["received"]["time"] == READ_TIME, conversations
                         log.seek(0)
                         assert "saved context" not in log.read(), "history was spoken"
                     finally:
                         if client.poll() is None:
                             client.terminate()
                             client.wait(timeout=5)
-            print(f"PASS: channel history restores in order without duplicates on login and restart; message-tags={message_tags}, capped={capped}")
+            print(f"PASS: channel history restores in order without duplicates on login and restart; message-tags={message_tags}, capped={capped}, already-read={already_read}")
         finally:
             bouncer.shutdown()
 
@@ -152,4 +169,5 @@ auto_connect = true
 if __name__ == "__main__":
     for message_tags in (True, False):
         run_case(message_tags)
+        run_case(message_tags, already_read=True)
     run_case(True, capped=True)
