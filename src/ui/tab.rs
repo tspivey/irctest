@@ -188,15 +188,3 @@ pub struct HistoryInsertion {
 /// Lines kept in each tab's output.
 const MAX_LINES: i64 = 10_000;
 
-/// Sets a notebook tab's label. wxDragon's `Notebook` has no binding for this, so it calls
-/// wxDragon's `wxd_Treebook_SetPageText`, which does `((wxTreebook*)self)->SetPageText(...)`:
-/// a virtual call on `wxBookCtrlBase`, so it reaches `wxNotebook::SetPageText`. Technically
-/// undefined behaviour (the object isn't a wxTreebook); switch to a `wxd_Notebook_SetPageText`
-/// binding if wxDragon gains one.
-pub fn set_page_text(notebook: &Notebook, page: usize, text: &str) {
-    let Ok(text) = std::ffi::CString::new(text) else {
-        return;
-    };
-    let ptr = notebook.handle_ptr() as *mut wxdragon::ffi::wxd_Treebook_t;
-    unsafe { wxdragon::ffi::wxd_Treebook_SetPageText(ptr, page, text.as_ptr()) };
-}

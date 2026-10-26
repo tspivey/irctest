@@ -26,7 +26,7 @@ use wxdragon::prelude::*;
 
 use super::cert_dialog::CertificateChoice;
 use super::foreground::app_is_foreground;
-use super::tab::{Tab, set_page_text};
+use super::tab::Tab;
 
 pub type TabId = u64;
 
@@ -1528,7 +1528,7 @@ impl State {
                 self.servers[s].tabs[t].name,
                 if unread { " [unread]" } else { "" }
             );
-            set_page_text(&self.notebook, self.page_index(s, t), &label);
+            self.notebook.set_page_text(self.page_index(s, t), &label);
         }
     }
     fn restore_history(
@@ -1669,7 +1669,7 @@ impl State {
             .collect();
         for (c, label) in labels {
             self.servers[c].tabs[0].name = label.clone();
-            set_page_text(&self.notebook, self.page_index(c, 0), &label);
+            self.notebook.set_page_text(self.page_index(c, 0), &label);
         }
     }
     fn child_actions(&mut self, parent: usize, actions: Vec<irctest::connections::ChildAction>) {
@@ -1715,7 +1715,7 @@ impl State {
                         c
                     });
                     self.servers[c].tabs[0].name = label.clone();
-                    set_page_text(&self.notebook, self.page_index(c, 0), &label);
+                    self.notebook.set_page_text(self.page_index(c, 0), &label);
                     self.servers[c].config = self.servers[parent].config.clone();
                     self.servers[c].config.discover_networks = false;
                     self.servers[c].accepted_fingerprints =
