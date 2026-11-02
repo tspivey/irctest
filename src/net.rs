@@ -822,15 +822,19 @@ impl Connection {
                         false,
                     ));
                 }
+                if let Some(nick) = args.first() {
+                    self.set_nick(nick);
+                }
+                // Bouncers can resend 001 after reconnecting upstream; registration is done.
+                if self.registered {
+                    return None;
+                }
                 self.registered = true;
                 self.role_deadline = Some(Instant::now() + Duration::from_secs(5));
                 // The server didn't wait for SASL (or doesn't know CAP).
                 self.sasl = Sasl::Idle;
                 self.negotiation.abandon_registration();
                 self.negotiation_deadline = None;
-                if let Some(nick) = args.first() {
-                    self.set_nick(nick);
-                }
                 if !self.discovery_possible() {
                     self.run_connect_commands();
                 }
@@ -1063,10 +1067,11 @@ impl Connection {
         self.can_collect_networks() && self.authenticated
     }
     fn decide_role(&mut self) {
+        // Cleared first: a deadline left in the past would fire on every turn of read_loop.
+        self.role_deadline = None;
         if !self.registered || self.role.is_some() {
             return;
         }
-        self.role_deadline = None;
         let role = if let Some(id) = self
             .reg
             .options
@@ -2330,6 +2335,42 @@ mod tests {
         assert!(fake.recv().await.starts_with("PING "));
         assert!(!fake.session.is_finished());
         fake.session.abort();
+    }
+
+    #[test]
+    fn repeated_welcome_updates_nick_and_leaves_session_idle() {
+        // A busy session keeps paused time from auto-advancing, which would hang the
+        // runtime rather than fail; run it on its own thread so the test can give up.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut fake = Fake::registered("", &["JOIN #once"]).await;
+                let start = Instant::now();
+                fake.send(":s 001 tyler :Welcome").await;
+                assert_eq!(fake.recv().await, "JOIN #once");
+                while !matches!(fake.event().await, NetEvent::Role(_)) {}
+                // Bouncers can resend 001 after their upstream reconnects.
+                fake.send(":s 001 tyler2 :Welcome back").await;
+                while !matches!(fake.event().await, NetEvent::NickChanged(n) if n == "tyler2") {}
+                assert!(fake.recv().await.starts_with("PING "));
+                assert_eq!(start.elapsed(), PING_INTERVAL);
+                assert!(!fake.session.is_finished());
+                fake.session.abort();
+            });
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the session stayed busy after a repeated 001")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("test body failed"),
+        }
     }
 
     #[tokio::test(start_paused = true)]
